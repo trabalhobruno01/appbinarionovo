@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type, type Content, type Part } from '@google/genai';
 import type {
   BrasiliaTimeSync,
   ChartAnalysisResult,
@@ -17,6 +17,7 @@ import {
   recordGeminiFailure,
   recordGeminiSuccess,
   recordLatency,
+  sanitizeErrorMessage,
 } from './usageTracker.ts';
 
 function getGeminiClient(): GoogleGenAI {
@@ -202,6 +203,177 @@ function parseBase64Image(dataUrlOrBase64: string, fallbackMime = 'image/jpeg'):
     return { mimeType: match[1], data: match[2] };
   }
   return { mimeType: fallbackMime, data: dataUrlOrBase64 };
+}
+
+export type LegacyAwareChatEntry = Partial<ChatMessage> & {
+  role?: string;
+  parts?: Part[];
+  content?: string;
+  functionCall?: Part['functionCall'];
+  functionResponse?: Part['functionResponse'];
+};
+
+function isValidGeminiPart(part: unknown): part is Part {
+  if (!part || typeof part !== 'object') return false;
+  const p = part as Record<string, unknown>;
+  if (typeof p.text === 'string') return p.text.trim().length > 0;
+  if (p.inlineData && typeof p.inlineData === 'object') return true;
+  if (p.fileData && typeof p.fileData === 'object') return true;
+  if (p.functionCall && typeof p.functionCall === 'object') return true;
+  if (p.functionResponse && typeof p.functionResponse === 'object') return true;
+  return false;
+}
+
+export function validateGeminiContents(contents: Content[]): Content[] {
+  if (!Array.isArray(contents) || contents.length === 0) {
+    const msg = '[ChartPulse][Gemini] Payload inválido: contents vazio antes da chamada à API.';
+    console.error(sanitizeErrorMessage(msg));
+    throw new Error('Histórico inválido para envio ao modelo Gemini.');
+  }
+
+  for (let i = 0; i < contents.length; i += 1) {
+    const entry = contents[i];
+    if (!entry || (entry.role !== 'user' && entry.role !== 'model')) {
+      const safeRole = sanitizeErrorMessage(String(entry?.role ?? 'undefined'));
+      console.error(`[ChartPulse][Gemini] Role inválido bloqueado antes da chamada (índice ${i}): ${safeRole}`);
+      throw new Error(`Role inválido detectado antes do envio ao Gemini (${safeRole}).`);
+    }
+
+    if (!Array.isArray(entry.parts) || entry.parts.length === 0) {
+      console.error(`[ChartPulse][Gemini] Mensagem sem parts válidos bloqueada (índice ${i}, role ${entry.role}).`);
+      throw new Error('Mensagem sem conteúdo válido para envio ao Gemini.');
+    }
+
+    for (const part of entry.parts) {
+      if (!isValidGeminiPart(part)) {
+        console.error(`[ChartPulse][Gemini] Part inválido bloqueado (índice ${i}, role ${entry.role}).`);
+        throw new Error('Parte de mensagem inválida para envio ao Gemini.');
+      }
+      if ('functionCall' in part && part.functionCall && entry.role !== 'model') {
+        console.error(`[ChartPulse][Gemini] functionCall exige role="model" (índice ${i}).`);
+        throw new Error('Chamada de ferramenta com role incompatível.');
+      }
+      if ('functionResponse' in part && part.functionResponse && entry.role !== 'user') {
+        console.error(`[ChartPulse][Gemini] functionResponse exige role="user" (índice ${i}).`);
+        throw new Error('Resposta de ferramenta com role incompatível.');
+      }
+    }
+  }
+
+  if (contents[contents.length - 1]?.role !== 'user') {
+    console.error('[ChartPulse][Gemini] Última mensagem do payload precisa ter role="user".');
+    throw new Error('Sequência de conversa inválida: última mensagem deve ser do usuário.');
+  }
+
+  return contents;
+}
+
+export function buildGeminiContentsFromHistory(params: {
+  messages: LegacyAwareChatEntry[];
+  currentUserParts: Part[];
+  maxHistoryTurns?: number;
+}): { contents: Content[]; extraSystemInstructions: string[] } {
+  const maxTurns = params.maxHistoryTurns ?? 4;
+  const extraSystemInstructions: string[] = [];
+  const normalizedHistory: Content[] = [];
+
+  const recentEntries = Array.isArray(params.messages)
+    ? params.messages.slice(-Math.max(maxTurns * 2, maxTurns))
+    : [];
+
+  for (const item of recentEntries) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.error === true) continue;
+
+    const rawRole = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
+    const rawText =
+      typeof item.text === 'string'
+        ? item.text.trim()
+        : typeof item.content === 'string'
+          ? item.content.trim()
+          : '';
+
+    // System/developer messages must never enter contents[] — move to systemInstruction
+    if (rawRole === 'system' || rawRole === 'developer') {
+      if (rawText) {
+        extraSystemInstructions.push(rawText.slice(0, 400));
+      }
+      continue;
+    }
+
+    const parts: Part[] = [];
+    if (Array.isArray(item.parts) && item.parts.length > 0) {
+      for (const p of item.parts) {
+        if (isValidGeminiPart(p)) {
+          parts.push(p);
+        }
+      }
+    } else {
+      if (item.functionCall && typeof item.functionCall === 'object') {
+        parts.push({ functionCall: item.functionCall });
+      }
+      if (item.functionResponse && typeof item.functionResponse === 'object') {
+        parts.push({ functionResponse: item.functionResponse });
+      }
+      if (rawText) {
+        parts.push({ text: rawText.slice(0, 600) });
+      }
+    }
+
+    if (parts.length === 0) continue;
+
+    let mappedRole: 'user' | 'model' | null = null;
+    if (rawRole === 'user') {
+      mappedRole = 'user';
+    } else if (rawRole === 'assistant' || rawRole === 'model') {
+      mappedRole = 'model';
+    } else if (
+      (rawRole === 'tool' || rawRole === 'function') &&
+      parts.some((p) => 'functionResponse' in p && Boolean(p.functionResponse))
+    ) {
+      mappedRole = 'user';
+    } else {
+      console.warn(
+        `[ChartPulse][Gemini] Registro histórico ignorado por role incompatível: ${sanitizeErrorMessage(rawRole || 'ausente')}`,
+      );
+      continue;
+    }
+
+    const hasFnCall = parts.some((p) => 'functionCall' in p && Boolean(p.functionCall));
+    const hasFnResp = parts.some((p) => 'functionResponse' in p && Boolean(p.functionResponse));
+    if ((hasFnCall && mappedRole !== 'model') || (hasFnResp && mappedRole !== 'user')) {
+      console.warn(
+        `[ChartPulse][Gemini] Registro de ferramenta ignorado por inconsistência entre part e role (${mappedRole}).`,
+      );
+      continue;
+    }
+
+    const prev = normalizedHistory[normalizedHistory.length - 1];
+    if (prev && prev.role === mappedRole && prev.parts) {
+      prev.parts.push(...parts);
+    } else {
+      normalizedHistory.push({ role: mappedRole, parts });
+    }
+  }
+
+  // Keep only the most recent maxTurns while ensuring conversation starts with a 'user' turn
+  let boundedHistory = normalizedHistory.slice(-maxTurns);
+  while (boundedHistory.length > 0 && boundedHistory[0]?.role !== 'user') {
+    boundedHistory = boundedHistory.slice(1);
+  }
+
+  const validCurrentParts = params.currentUserParts.filter((p) => isValidGeminiPart(p));
+  const lastTurn = boundedHistory[boundedHistory.length - 1];
+  if (lastTurn && lastTurn.role === 'user' && lastTurn.parts) {
+    lastTurn.parts.push(...validCurrentParts);
+  } else {
+    boundedHistory.push({ role: 'user', parts: validCurrentParts });
+  }
+
+  return {
+    contents: boundedHistory,
+    extraSystemInstructions,
+  };
 }
 
 function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | null): {
@@ -513,6 +685,18 @@ async function runChartAnalysisUncached(params: {
     const tSyncStart = Date.now();
     const tPass1Start = Date.now();
     try {
+      const pass1Contents = validateGeminiContents([
+        {
+          role: 'user',
+          parts: [
+            imagePart,
+            {
+              text: 'Identifique apenas se é um gráfico financeiro legível, o código do ativo, o timeframe e o último preço visível. Não invente dados ilegíveis. Se não for legível, escreva unreadableReason em português (PT-BR).',
+            },
+          ],
+        },
+      ]);
+
       const [syncRes, extractResp] = await Promise.all([
         getSynchronizedBrasiliaTime(false).then((r) => {
           timeSyncMs = Date.now() - tSyncStart;
@@ -520,14 +704,7 @@ async function runChartAnalysisUncached(params: {
         }),
         ai.models.generateContent({
           model: GEMINI_MODEL,
-          contents: {
-            parts: [
-              imagePart,
-              {
-                text: 'Identifique apenas se é um gráfico financeiro legível, o código do ativo, o timeframe e o último preço visível. Não invente dados ilegíveis. Se não for legível, escreva unreadableReason em português (PT-BR).',
-              },
-            ],
-          },
+          contents: pass1Contents,
           config: {
             thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             responseMimeType: 'application/json',
@@ -624,9 +801,15 @@ async function runChartAnalysisUncached(params: {
   try {
     await assertNotInRateLimitCooldown();
     const tGemStart = Date.now();
+    const pass2Contents = validateGeminiContents([
+      {
+        role: 'user',
+        parts: [imagePart, { text: decisionPrompt }],
+      },
+    ]);
     const finalResp = await ai.models.generateContent({
       model: GEMINI_MODEL,
-      contents: { parts: [imagePart, { text: decisionPrompt }] },
+      contents: pass2Contents,
       config: {
         systemInstruction,
         thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
@@ -932,18 +1115,13 @@ export async function continueChartChat(params: {
     ? quoteCtx.contextText
     : 'Nenhum ativo específico consultado nesta mensagem.';
 
-  // Send only up to 3 prior messages (excluding duplicate of current userMessage) to minimize token spend
+  // Exclude duplicate trailing user message matching the active userMessage
   const priorMessages =
     params.messages.length > 0 &&
     params.messages[params.messages.length - 1]?.role === 'user' &&
     params.messages[params.messages.length - 1]?.text.trim() === params.userMessage.trim()
       ? params.messages.slice(0, -1)
       : params.messages;
-
-  const compactHistory = priorMessages
-    .slice(-3)
-    .map((m) => `${m.role === 'user' ? 'U' : 'IA'}(${m.createdAtBrt}): ${m.text.slice(0, 320)}`)
-    .join('\n');
 
   // Re-attach the chart image ONLY when clarifying missing asset/timeframe or explicitly asked to re-examine the photo
   const needsVisualReeval =
@@ -961,7 +1139,6 @@ export async function continueChartChat(params: {
       ? `ÚLTIMA ANÁLISE:\n${prevAnalysis ? prevAnalysis.formattedReport : 'Fotografia enviada anteriormente.'}`
       : 'MODO CONVERSA DIRETA (nenhuma fotografia enviada ainda): responda dúvidas sobre mercado, análise técnica, gestão de risco ou ativos. Se houver cotação ao vivo abaixo, use os números reais. Só marque shouldAttachStructuredCard=true se houver análise anterior ou pedido explícito de sinal com dados suficientes; caso contrário mantenha shouldAttachStructuredCard=false.',
     `COTAÇÃO ATUAL:\n${quoteSection}`,
-    compactHistory ? `ÚLTIMAS MENSAGENS:\n${compactHistory}` : null,
     `PERGUNTA: "${params.userMessage}"`,
     hasPhotoOrAnalysis
       ? 'Se o sinal anterior já passou da entrada, alvo, stop ou horário, responda "SINAL EXPIRADO — NÃO ENTRAR NESTA CONDIÇÃO. AGUARDAR NOVA OPORTUNIDADE." Marque shouldAttachStructuredCard=true apenas em reanálise/expiração formal.'
@@ -998,11 +1175,25 @@ export async function continueChartChat(params: {
     required: ['replyText', 'shouldAttachStructuredCard', 'expired'],
   };
 
-  const parts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
+  const currentParts: Part[] = [];
   if (needsVisualReeval && lastImageMsg?.imageDataUrl) {
-    parts.push({ inlineData: parseBase64Image(lastImageMsg.imageDataUrl) });
+    currentParts.push({ inlineData: parseBase64Image(lastImageMsg.imageDataUrl) });
   }
-  parts.push({ text: prompt });
+  currentParts.push({ text: prompt });
+
+  const { contents: rawChatContents, extraSystemInstructions } = buildGeminiContentsFromHistory({
+    messages: priorMessages,
+    currentUserParts: currentParts,
+    maxHistoryTurns: 4,
+  });
+  const validatedChatContents = validateGeminiContents(rawChatContents);
+
+  const systemInstruction = [
+    'Analista financeiro conversacional conservador (PT-BR). Lógica de opções binárias: COMPRA (CALL) = aposta em SUBIDA acima da entrada no vencimento; VENDA (PUT) = aposta em QUEDA abaixo da entrada no vencimento. Nunca inverta direções, nunca recomende martingale ou recuperação dobrando mão, nunca prometa lucro e priorize proteção do capital.',
+    ...extraSystemInstructions,
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   let rawJson = '{}';
   let geminiMs = 0;
@@ -1010,10 +1201,9 @@ export async function continueChartChat(params: {
     const tGemStart = Date.now();
     const resp = await ai.models.generateContent({
       model: GEMINI_MODEL,
-      contents: { parts },
+      contents: validatedChatContents,
       config: {
-        systemInstruction:
-          'Analista financeiro conversacional conservador (PT-BR). Lógica de opções binárias: COMPRA (CALL) = aposta em SUBIDA acima da entrada no vencimento; VENDA (PUT) = aposta em QUEDA abaixo da entrada no vencimento. Nunca inverta direções, nunca recomende martingale ou recuperação dobrando mão, nunca prometa lucro e priorize proteção do capital.',
+        systemInstruction,
         thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
         responseMimeType: 'application/json',
         responseSchema: chatSchema,
