@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { App as CapacitorApp } from '@capacitor/app';
+import type { User } from 'firebase/auth';
 import {
   Camera,
   Image as ImageIcon,
@@ -11,20 +12,34 @@ import {
   Sun,
   X,
 } from 'lucide-react';
-import type { ChatMessage, Conversation } from '../shared/types.ts';
+import type { ChatMessage, Conversation, Project, TenantSessionInfo } from '../shared/types.ts';
 import { AnalysisCard } from './components/AnalysisCard.tsx';
 import { CameraModal } from './components/CameraModal.tsx';
 import { HistorySidebar } from './components/HistorySidebar.tsx';
 import { ImageEditorModal } from './components/ImageEditorModal.tsx';
+import { LoginScreen } from './components/LoginScreen.tsx';
 import { SignalAuditModal } from './components/SignalAuditModal.tsx';
 import {
+  abortPendingApiRequests,
   analyzeChartRequest,
   deleteRemoteConversation,
   fetchBrasiliaTime,
   fetchRemoteConversations,
+  fetchRemoteProjects,
+  fetchTenantSession,
+  registerUnauthorizedHandler,
   saveRemoteConversation,
+  saveRemoteProject,
   sendChatFollowUp,
 } from './services/api.ts';
+import { logoutUser, subscribeToAuthState } from './services/firebase.ts';
+import {
+  deleteConversationFromFirestore,
+  ensureFirestoreTenantDocuments,
+  syncConversationToFirestore,
+  syncProjectToFirestore,
+  testFirestoreConnection,
+} from './services/firebaseData.ts';
 import {
   captureNativePhoto,
   isNativeAndroid,
@@ -32,10 +47,15 @@ import {
 } from './services/camera.ts';
 import { fileToDataUrl, validateImageFile } from './services/imageProcessor.ts';
 import {
+  clearSessionCaches,
   deleteLocalConversation,
+  getSavedActiveProjectId,
   getSavedTheme,
   loadLocalConversations,
+  loadLocalProjects,
+  saveActiveProjectId,
   saveLocalConversation,
+  saveLocalProjects,
   saveTheme,
 } from './services/storage.ts';
 
@@ -66,7 +86,11 @@ function formatClientBrt(unixMs: number): { dateBrt: string; timeBrt: string; sh
   };
 }
 
-function createEmptyConversation(offsetMs: number): Conversation {
+function createEmptyConversation(
+  offsetMs: number,
+  tenant: TenantSessionInfo,
+  projectId: string,
+): Conversation {
   const nowBrt = formatClientBrt(Date.now() + offsetMs);
   const id =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -74,6 +98,9 @@ function createEmptyConversation(offsetMs: number): Conversation {
       : `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   return {
     id,
+    ownerUid: tenant.uid,
+    companyId: tenant.companyId,
+    projectId,
     title: 'Nova Análise',
     lastAsset: null,
     lastTimeframe: null,
@@ -84,14 +111,36 @@ function createEmptyConversation(offsetMs: number): Conversation {
   };
 }
 
-export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => getSavedTheme());
+function ChartPulseWorkspace({
+  tenant,
+  onLogout,
+}: {
+  tenant: TenantSessionInfo;
+  onLogout: () => Promise<void>;
+}) {
+  const defaultProjectId = `proj_${tenant.uid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'user'}`;
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => getSavedTheme(tenant.uid));
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [liveTimeBrt, setLiveTimeBrt] = useState(() => formatClientBrt(Date.now()).timeBrt);
 
+  const [projects, setProjects] = useState<Project[]>(() => [
+    {
+      id: defaultProjectId,
+      ownerUid: tenant.uid,
+      companyId: tenant.companyId,
+      name: 'Projeto Principal',
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    },
+  ]);
+  const [activeProjectId, setActiveProjectId] = useState<string>(
+    () => getSavedActiveProjectId(tenant.uid, tenant.companyId) || defaultProjectId,
+  );
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string>('');
-  const [draftConv, setDraftConv] = useState<Conversation>(() => createEmptyConversation(0));
+  const [draftConv, setDraftConv] = useState<Conversation>(() =>
+    createEmptyConversation(0, tenant, getSavedActiveProjectId(tenant.uid, tenant.companyId) || defaultProjectId),
+  );
 
   const [inputText, setInputText] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -112,7 +161,7 @@ export default function App() {
   const activeConversation =
     conversations.find((c) => c.id === activeConvId) || draftConv;
 
-  // Apply light/dark theme to <html>
+  // Apply light/dark theme to <html> scoped per authenticated user UID
   useEffect(() => {
     const root = document.documentElement;
     if (theme === 'dark') {
@@ -120,12 +169,12 @@ export default function App() {
     } else {
       root.classList.remove('dark');
     }
-    saveTheme(theme);
+    saveTheme(theme, tenant.uid);
     const metaTheme = document.querySelector('meta[name="theme-color"]');
     if (metaTheme) {
       metaTheme.setAttribute('content', theme === 'dark' ? '#0B0F17' : '#F8FAFC');
     }
-  }, [theme]);
+  }, [theme, tenant.uid]);
 
   const clockOffsetRef = useRef(0);
 
@@ -167,22 +216,77 @@ export default function App() {
     };
   }, []);
 
-  // Load persisted conversations (IndexedDB + remote sync)
+  // Load strictly isolated projects for this (uid, companyId)
+  useEffect(() => {
+    let mounted = true;
+    async function loadTenantProjects() {
+      void testFirestoreConnection();
+      void ensureFirestoreTenantDocuments({
+        uid: tenant.uid,
+        companyId: tenant.companyId,
+        email: tenant.email,
+      });
+
+      const localProjects = await loadLocalProjects(tenant.uid, tenant.companyId);
+      if (!mounted) return;
+      if (localProjects.length > 0) {
+        setProjects(localProjects);
+        if (!localProjects.some((p) => p.id === activeProjectId)) {
+          setActiveProjectId(localProjects[0].id);
+          saveActiveProjectId(tenant.uid, tenant.companyId, localProjects[0].id);
+        }
+      }
+
+      try {
+        const remoteProjects = await fetchRemoteProjects();
+        if (!mounted || remoteProjects.length === 0) return;
+        const owned = remoteProjects.filter(
+          (p) => p.ownerUid === tenant.uid && p.companyId === tenant.companyId,
+        );
+        if (owned.length > 0) {
+          setProjects(owned);
+          await saveLocalProjects(tenant.uid, tenant.companyId, owned);
+          if (!owned.some((p) => p.id === activeProjectId)) {
+            setActiveProjectId(owned[0].id);
+            saveActiveProjectId(tenant.uid, tenant.companyId, owned[0].id);
+          }
+        }
+      } catch {
+        // Offline or aborted on logout
+      }
+    }
+    void loadTenantProjects();
+    return () => {
+      mounted = false;
+    };
+  }, [tenant.uid, tenant.companyId]);
+
+  // Load persisted conversations strictly for (uid, companyId, activeProjectId)
   useEffect(() => {
     let mounted = true;
     async function loadHistory() {
-      const local = await loadLocalConversations();
+      const local = await loadLocalConversations(tenant.uid, tenant.companyId, activeProjectId);
       if (!mounted) return;
+      setConversations(local);
       if (local.length > 0) {
-        setConversations(local);
         setActiveConvId(local[0].id);
+      } else {
+        setActiveConvId('');
+        setDraftConv(createEmptyConversation(clockOffsetRef.current, tenant, activeProjectId));
       }
-      const remote = await fetchRemoteConversations();
+
+      const remote = await fetchRemoteConversations(activeProjectId);
       if (!mounted || remote.length === 0) return;
 
-      // Merge remote and local by updatedAtIso
       const mergedMap = new Map<string, Conversation>();
       for (const c of [...remote, ...local]) {
+        if (
+          c.ownerUid !== tenant.uid ||
+          c.companyId !== tenant.companyId ||
+          (c.projectId && c.projectId !== activeProjectId)
+        ) {
+          continue;
+        }
         const existing = mergedMap.get(c.id);
         if (!existing || c.updatedAtIso > existing.updatedAtIso) {
           mergedMap.set(c.id, c);
@@ -196,11 +300,11 @@ export default function App() {
         setActiveConvId(merged[0].id);
       }
     }
-    loadHistory();
+    void loadHistory();
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [tenant, activeProjectId]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -252,27 +356,65 @@ export default function App() {
     };
   }, [zoomedImageUrl, auditOpen, pendingRawImage, cameraOpen, historyOpen]);
 
-  const persistConversation = useCallback(async (conv: Conversation, syncRemote = true) => {
-    setConversations((prev) => {
-      const next = [conv, ...prev.filter((c) => c.id !== conv.id)].sort((a, b) =>
-        b.updatedAtIso.localeCompare(a.updatedAtIso),
-      );
-      return next;
-    });
-    setActiveConvId(conv.id);
-    await saveLocalConversation(conv);
-    if (syncRemote) {
-      void saveRemoteConversation(conv);
-    }
-  }, []);
+  const persistConversation = useCallback(
+    async (conv: Conversation, syncRemote = true) => {
+      const stamped: Conversation = {
+        ...conv,
+        ownerUid: tenant.uid,
+        companyId: tenant.companyId,
+        projectId: conv.projectId || activeProjectId,
+      };
+      setConversations((prev) => {
+        const next = [stamped, ...prev.filter((c) => c.id !== stamped.id)].sort((a, b) =>
+          b.updatedAtIso.localeCompare(a.updatedAtIso),
+        );
+        return next;
+      });
+      setActiveConvId(stamped.id);
+      await saveLocalConversation(tenant.uid, tenant.companyId, stamped);
+      if (syncRemote) {
+        void saveRemoteConversation(stamped);
+        void syncConversationToFirestore(stamped);
+      }
+    },
+    [tenant.uid, tenant.companyId, activeProjectId],
+  );
+
+  const handleSelectProject = useCallback(
+    (projectId: string) => {
+      setActiveProjectId(projectId);
+      saveActiveProjectId(tenant.uid, tenant.companyId, projectId);
+      setActiveConvId('');
+      setDraftConv(createEmptyConversation(clockOffsetMs, tenant, projectId));
+      setUiNotice(null);
+    },
+    [tenant, clockOffsetMs],
+  );
+
+  const handleCreateProject = useCallback(
+    async (name: string) => {
+      const created = await saveRemoteProject({ name });
+      setProjects((prev) => {
+        const next = [...prev, created];
+        void saveLocalProjects(tenant.uid, tenant.companyId, next);
+        return next;
+      });
+      void syncProjectToFirestore(created);
+      setActiveProjectId(created.id);
+      saveActiveProjectId(tenant.uid, tenant.companyId, created.id);
+      setActiveConvId('');
+      setDraftConv(createEmptyConversation(clockOffsetMs, tenant, created.id));
+    },
+    [tenant, clockOffsetMs],
+  );
 
   const handleNewChat = useCallback(() => {
-    const fresh = createEmptyConversation(clockOffsetMs);
+    const fresh = createEmptyConversation(clockOffsetMs, tenant, activeProjectId);
     setDraftConv(fresh);
     setActiveConvId('');
     setInputText('');
     setUiNotice(null);
-  }, [clockOffsetMs]);
+  }, [clockOffsetMs, tenant, activeProjectId]);
 
   const handleDeleteConversation = useCallback(
     async (id: string) => {
@@ -282,17 +424,22 @@ export default function App() {
           if (filtered.length > 0) {
             setActiveConvId(filtered[0].id);
           } else {
-            const fresh = createEmptyConversation(clockOffsetMs);
+            const fresh = createEmptyConversation(clockOffsetMs, tenant, activeProjectId);
             setDraftConv(fresh);
             setActiveConvId('');
           }
         }
         return filtered;
       });
-      await deleteLocalConversation(id);
+      await deleteLocalConversation(tenant.uid, tenant.companyId, id);
       await deleteRemoteConversation(id);
+      void deleteConversationFromFirestore({
+        companyId: tenant.companyId,
+        projectId: activeProjectId,
+        conversationId: id,
+      });
     },
-    [activeConvId, clockOffsetMs],
+    [activeConvId, clockOffsetMs, tenant, activeProjectId],
   );
 
   const handleOpenCamera = async () => {
@@ -384,6 +531,8 @@ export default function App() {
         userMessage: caption || undefined,
         photoReceivedAtBrt: photoTimestamp,
         history: baseConv.messages,
+        projectId: convWithUser.projectId || activeProjectId,
+        conversationId: convWithUser.id,
       });
 
       const syncedOffset = result.timeSync.unixMs - Date.now();
@@ -473,6 +622,8 @@ export default function App() {
         userMessage: text,
         lastAsset: convWithUser.lastAsset,
         lastTimeframe: convWithUser.lastTimeframe,
+        projectId: convWithUser.projectId || activeProjectId,
+        conversationId: convWithUser.id,
       });
 
       const syncedOffset = res.timeSync.unixMs - Date.now();
@@ -568,12 +719,18 @@ export default function App() {
       {/* History Sidebar / Mobile Drawer */}
       <HistorySidebar
         open={historyOpen}
+        projects={projects}
+        activeProjectId={activeProjectId}
         conversations={conversations}
         activeId={activeConversation.id}
+        isAuthenticated={true}
+        onSelectProject={handleSelectProject}
+        onCreateProject={handleCreateProject}
         onSelect={(id) => setActiveConvId(id)}
         onNewChat={handleNewChat}
         onDelete={handleDeleteConversation}
         onOpenAudit={() => setAuditOpen(true)}
+        onLogout={onLogout}
         onClose={() => setHistoryOpen(false)}
       />
 
@@ -869,5 +1026,128 @@ export default function App() {
       {/* Independent Signal Validation & Backtest Modal */}
       <SignalAuditModal open={auditOpen} onClose={() => setAuditOpen(false)} />
     </div>
+  );
+}
+
+function resetUnauthenticatedUrl(): void {
+  if (typeof window === 'undefined') return;
+  if (window.location.pathname !== '/' || window.location.search || window.location.hash) {
+    window.history.replaceState(null, '', '/');
+  }
+}
+
+export default function App() {
+  const [authUser, setAuthUser] = useState<User | null | undefined>(undefined);
+  const [tenantSession, setTenantSession] = useState<TenantSessionInfo | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToAuthState((user) => {
+      setAuthUser(user);
+      if (user) {
+        setAuthNotice(null);
+      } else {
+        abortPendingApiRequests();
+        clearSessionCaches();
+        setTenantSession(null);
+        resetUnauthenticatedUrl();
+      }
+    });
+
+    registerUnauthorizedHandler(() => {
+      abortPendingApiRequests();
+      clearSessionCaches();
+      setTenantSession(null);
+      setAuthNotice('Sessão expirada ou inválida. Faça login novamente.');
+      void logoutUser().catch(() => {
+        setAuthUser(null);
+      });
+    });
+
+    return () => {
+      unsubscribe();
+      registerUnauthorizedHandler(null);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) {
+      setTenantSession(null);
+      return;
+    }
+    let active = true;
+    async function resolveSession() {
+      try {
+        const info = await fetchTenantSession();
+        if (!active || info.uid !== authUser?.uid) return;
+        setTenantSession(info);
+      } catch {
+        if (!active || !authUser) return;
+        const safeUid = authUser.uid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+        setTenantSession({
+          uid: authUser.uid,
+          email: authUser.email,
+          companyId: `cmp_${safeUid || 'user'}`,
+        });
+      }
+    }
+    void resolveSession();
+    return () => {
+      active = false;
+    };
+  }, [authUser]);
+
+  useEffect(() => {
+    if (authUser) return;
+    resetUnauthenticatedUrl();
+    const handlePopState = () => {
+      resetUnauthenticatedUrl();
+      if (authUser === null) {
+        window.history.pushState({ auth: 'login' }, '', '/');
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, [authUser]);
+
+  const handleLogout = useCallback(async () => {
+    abortPendingApiRequests();
+    clearSessionCaches();
+    setAuthNotice(null);
+    setTenantSession(null);
+    await logoutUser();
+    setAuthUser(null);
+    window.history.replaceState({ auth: 'login' }, '', '/');
+    window.history.pushState({ auth: 'login' }, '', '/');
+  }, []);
+
+  if (authUser === undefined || (authUser && !tenantSession)) {
+    return (
+      <div className="flex min-h-[100dvh] w-full items-center justify-center bg-[#0B0F17] text-slate-100">
+        <div
+          aria-label="Verificando sessão"
+          className="h-7 w-7 animate-spin rounded-full border-2 border-slate-700 border-t-emerald-500"
+        />
+      </div>
+    );
+  }
+
+  if (!authUser || !tenantSession) {
+    return (
+      <LoginScreen
+        notice={authNotice}
+        onClearNotice={() => setAuthNotice(null)}
+      />
+    );
+  }
+
+  return (
+    <ChartPulseWorkspace
+      key={`${tenantSession.uid}:${tenantSession.companyId}`}
+      tenant={tenantSession}
+      onLogout={handleLogout}
+    />
   );
 }

@@ -13,39 +13,62 @@ import type {
   WalkForwardBacktestResult,
 } from '../shared/types.ts';
 import { fetchHistoricalCandles, fetchReferencePriceAtTime } from './marketData.ts';
+import { getTenantScopeKey, getTenantStorageDir } from './tenantRegistry.ts';
 import { formatTimestampBrt } from './timeService.ts';
+import type { TenantRef } from './usageTracker.ts';
 
 export const MIN_SAMPLE_FOR_STATS = 30;
 export const DEFAULT_PAYOUT_PERCENT = 80;
 export const DEFAULT_TIE_RULE: TieRule = 'REFUND';
 
-function getLedgerFilePath(): string {
-  if (process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME) {
-    return '/tmp/chartpulse-signal-ledger.json';
+const tenantLedgers = new Map<string, SignalRecord[]>();
+const loadedLedgerScopes = new Set<string>();
+
+function resolveLedgerScope(tenant?: TenantRef): { key: string; filePath: string } {
+  if (tenant?.uid && tenant?.companyId) {
+    return {
+      key: getTenantScopeKey(tenant.companyId, tenant.uid),
+      filePath: path.join(getTenantStorageDir(tenant.companyId, tenant.uid), 'signal-ledger.json'),
+    };
   }
-  return path.resolve(process.cwd(), '.data', 'signal-ledger.json');
+  const fallback =
+    process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
+      ? '/tmp/chartpulse-signal-ledger.json'
+      : path.resolve(process.cwd(), '.data', 'signal-ledger.json');
+  return { key: '_system', filePath: fallback };
 }
 
-let ledgerLoaded = false;
-let ledger: SignalRecord[] = [];
-
-async function ensureLedgerLoaded(): Promise<void> {
-  if (ledgerLoaded) return;
-  ledgerLoaded = true;
-  try {
-    const raw = await fs.readFile(getLedgerFilePath(), 'utf-8');
-    const parsed = JSON.parse(raw) as SignalRecord[];
-    if (Array.isArray(parsed)) {
-      ledger = parsed;
-    }
-  } catch {
+async function ensureLedgerLoaded(tenant?: TenantRef): Promise<{ ledger: SignalRecord[]; filePath: string }> {
+  const { key, filePath } = resolveLedgerScope(tenant);
+  let ledger = tenantLedgers.get(key);
+  if (!ledger) {
     ledger = [];
+    tenantLedgers.set(key, ledger);
   }
+  if (!loadedLedgerScopes.has(key)) {
+    loadedLedgerScopes.add(key);
+    try {
+      const raw = await fs.readFile(filePath, 'utf-8');
+      const parsed = JSON.parse(raw) as SignalRecord[];
+      if (Array.isArray(parsed)) {
+        const filtered = tenant?.uid
+          ? parsed.filter(
+              (r) =>
+                (!r.ownerUid || r.ownerUid === tenant.uid) &&
+                (!r.companyId || r.companyId === tenant.companyId),
+            )
+          : parsed;
+        ledger.splice(0, ledger.length, ...filtered);
+      }
+    } catch {
+      // Start empty for this tenant
+    }
+  }
+  return { ledger, filePath };
 }
 
-async function persistLedger(): Promise<void> {
+async function persistLedger(filePath: string, ledger: SignalRecord[]): Promise<void> {
   try {
-    const filePath = getLedgerFilePath();
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(filePath, JSON.stringify(ledger.slice(0, 500), null, 2), 'utf-8');
   } catch {
@@ -171,6 +194,7 @@ export async function recordEmittedSignal(params: {
   origin?: 'LIVE_AI' | 'DEMO_ACCOUNT';
   payoutPercent?: number;
   tieRule?: TieRule;
+  tenant?: TenantRef & { projectId?: string };
 }): Promise<SignalRecord | null> {
   const { analysis, marketQuote } = params;
   // Never register non-directional or expired decisions as active trade signals
@@ -179,7 +203,7 @@ export async function recordEmittedSignal(params: {
   }
   if (!analysis.asset) return null;
 
-  await ensureLedgerLoaded();
+  const { ledger, filePath } = await ensureLedgerLoaded(params.tenant);
   const nowMs = Date.now();
   const issuedBrt = formatTimestampBrt(nowMs);
   const expMinutes = parseExpirationMinutes(analysis.expirationDuration, analysis.timeframe);
@@ -193,7 +217,7 @@ export async function recordEmittedSignal(params: {
   const expiryBrt = formatTimestampBrt(expiryTimeMs);
   const entryRef = parseEntryPriceNumeric(analysis.entryPrice, marketQuote);
 
-  // Deduplicate identical signal emitted within 20 seconds for same asset/direction/entry
+  // Deduplicate identical signal emitted within 20 seconds for same asset/direction/entry within THIS tenant
   const duplicate = ledger.find(
     (s) =>
       s.asset === analysis.asset &&
@@ -204,6 +228,9 @@ export async function recordEmittedSignal(params: {
 
   const record: SignalRecord = {
     id: `sig_${crypto.randomBytes(5).toString('hex')}`,
+    ...(params.tenant?.uid ? { ownerUid: params.tenant.uid } : {}),
+    ...(params.tenant?.companyId ? { companyId: params.tenant.companyId } : {}),
+    ...(params.tenant?.projectId ? { projectId: params.tenant.projectId } : {}),
     origin: params.origin || 'LIVE_AI',
     asset: analysis.asset,
     normalizedSymbol: analysis.normalizedSymbol || marketQuote?.symbol || null,
@@ -229,15 +256,16 @@ export async function recordEmittedSignal(params: {
   };
 
   ledger.unshift(record);
-  await persistLedger();
+  await persistLedger(filePath, ledger);
   return record;
 }
 
 export async function settlePendingSignals(
   payoutPercent = DEFAULT_PAYOUT_PERCENT,
   tieRule: TieRule = DEFAULT_TIE_RULE,
+  tenant?: TenantRef,
 ): Promise<{ settledNow: number; stillPending: number }> {
-  await ensureLedgerLoaded();
+  const { ledger, filePath } = await ensureLedgerLoaded(tenant);
   const nowMs = Date.now();
   let settledNow = 0;
   let stillPending = 0;
@@ -304,7 +332,7 @@ export async function settlePendingSignals(
     settledNow += 1;
   }
 
-  await persistLedger();
+  await persistLedger(filePath, ledger);
   return { settledNow, stillPending };
 }
 
@@ -360,12 +388,12 @@ export async function getValidationSummary(
   payoutPercent = DEFAULT_PAYOUT_PERCENT,
   tieRule: TieRule = DEFAULT_TIE_RULE,
   settleExpired = true,
+  tenant?: TenantRef,
 ): Promise<SignalValidationSummary> {
   if (settleExpired) {
-    await settlePendingSignals(payoutPercent, tieRule);
-  } else {
-    await ensureLedgerLoaded();
+    await settlePendingSignals(payoutPercent, tieRule, tenant);
   }
+  const { ledger } = await ensureLedgerLoaded(tenant);
 
   let pendingSignals = 0;
   let wins = 0;

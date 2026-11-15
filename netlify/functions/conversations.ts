@@ -1,63 +1,75 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import {
+  deleteConversation,
+  getConversationById,
+  listConversations,
+  saveConversation,
+} from '../../server/conversationStore.ts';
+import { authErrorResponse, verifyFirebaseIdTokenHeader } from '../../server/firebaseAuth.ts';
+import { assertNoTenantSpoofing, TenantAccessError } from '../../server/tenantRegistry.ts';
 import type { Conversation } from '../../shared/types.ts';
 
-const TMP_DIR = '/tmp/chartpulse-conversations';
-
-function cleanId(raw: string | null): string {
-  return (raw || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
-}
-
-async function readStore(clientId: string | null): Promise<Conversation[]> {
-  try {
-    const raw = await fs.readFile(path.join(TMP_DIR, `${cleanId(clientId)}.json`), 'utf-8');
-    const parsed = JSON.parse(raw) as Conversation[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-async function writeStore(clientId: string | null, list: Conversation[]): Promise<void> {
-  await fs.mkdir(TMP_DIR, { recursive: true });
-  await fs.writeFile(path.join(TMP_DIR, `${cleanId(clientId)}.json`), JSON.stringify(list), 'utf-8');
-}
-
 export default async (req: Request): Promise<Response> => {
-  const clientId = req.headers.get('x-client-token');
+  let authUser;
   const url = new URL(req.url);
+  try {
+    authUser = await verifyFirebaseIdTokenHeader(req.headers.get('authorization'));
+    assertNoTenantSpoofing(
+      authUser,
+      [req.headers.get('x-company-id'), url.searchParams.get('companyId')],
+      'companyId',
+    );
+    assertNoTenantSpoofing(
+      authUser,
+      [req.headers.get('x-owner-uid'), url.searchParams.get('ownerUid'), url.searchParams.get('uid')],
+      'uid',
+    );
+  } catch (err) {
+    return authErrorResponse(err);
+  }
+
   const idParam = url.searchParams.get('id');
+  const pathLast = url.pathname.split('/').filter(Boolean).pop();
+  const targetId =
+    idParam || (pathLast && pathLast !== 'conversations' ? decodeURIComponent(pathLast) : undefined);
 
   try {
     if (req.method === 'GET') {
-      const conversations = await readStore(clientId);
-      return Response.json({ conversations });
+      if (targetId) {
+        const conversation = await getConversationById(authUser, targetId);
+        return Response.json({ conversation }, { headers: { 'Cache-Control': 'no-store, private' } });
+      }
+      const projectId = url.searchParams.get('projectId') || undefined;
+      const conversations = await listConversations(authUser, projectId);
+      return Response.json({ conversations }, { headers: { 'Cache-Control': 'no-store, private' } });
     }
 
     if (req.method === 'POST') {
       const conv = (await req.json()) as Conversation;
+      assertNoTenantSpoofing(authUser, [conv?.companyId], 'companyId');
+      assertNoTenantSpoofing(authUser, [conv?.ownerUid], 'uid');
       if (!conv?.id) {
         return Response.json({ error: 'Conversa inválida.' }, { status: 400 });
       }
-      const existing = await readStore(clientId);
-      const updated = [conv, ...existing.filter((c) => c.id !== conv.id)].slice(0, 50);
-      await writeStore(clientId, updated);
-      return Response.json({ conversation: conv });
+      const saved = await saveConversation(authUser, conv);
+      return Response.json({ conversation: saved }, { headers: { 'Cache-Control': 'no-store, private' } });
     }
 
     if (req.method === 'DELETE') {
-      const targetId = idParam || url.pathname.split('/').pop();
-      const existing = await readStore(clientId);
-      const updated = existing.filter((c) => c.id !== targetId);
-      await writeStore(clientId, updated);
-      return Response.json({ ok: true });
+      if (!targetId) {
+        return Response.json({ error: 'ID da conversa é obrigatório.' }, { status: 400 });
+      }
+      await deleteConversation(authUser, targetId);
+      return Response.json({ ok: true }, { headers: { 'Cache-Control': 'no-store, private' } });
     }
 
     return Response.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err) {
+    if (err instanceof TenantAccessError) {
+      return authErrorResponse(err);
+    }
     return Response.json(
       { error: err instanceof Error ? err.message : 'Erro no histórico.' },
-      { status: 500 },
+      { status: 500, headers: { 'Cache-Control': 'no-store, private' } },
     );
   }
 };

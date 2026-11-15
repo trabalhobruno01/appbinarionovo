@@ -18,7 +18,13 @@ import {
   recordGeminiSuccess,
   recordLatency,
   sanitizeErrorMessage,
+  type TenantRef,
 } from './usageTracker.ts';
+
+export interface AiTenantContext extends TenantRef {
+  projectId?: string;
+  conversationId?: string;
+}
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -70,9 +76,18 @@ function computeAnalysisCacheKey(
   userMessage?: string,
   hintAsset?: string | null,
   hintTimeframe?: string | null,
+  tenant?: AiTenantContext,
 ): string {
   return crypto
     .createHash('sha256')
+    .update(tenant?.companyId || '_global')
+    .update('|')
+    .update(tenant?.uid || '_anon')
+    .update('|')
+    .update(tenant?.projectId || '_proj')
+    .update('|')
+    .update(tenant?.conversationId || '_conv')
+    .update('|')
     .update(imageDataUrl)
     .update('|')
     .update((userMessage || '').trim().toLowerCase())
@@ -778,9 +793,10 @@ async function runChartAnalysisUncached(params: {
   userMessage?: string;
   photoReceivedAtBrt?: string;
   history?: ChatMessage[];
+  tenant?: AiTenantContext;
 }): Promise<AnalysisBundle> {
   const tStart = Date.now();
-  await assertNotInRateLimitCooldown();
+  await assertNotInRateLimitCooldown(params.tenant);
   const ai = getGeminiClient();
   const { mimeType, data } = parseBase64Image(params.imageDataUrl);
   const imagePart = { inlineData: { mimeType, data } };
@@ -861,7 +877,7 @@ async function runChartAnalysisUncached(params: {
       ]);
       geminiMs += Date.now() - tPass1Start;
       timeSync = syncRes;
-      await recordGeminiSuccess(extractResp.usageMetadata);
+      await recordGeminiSuccess(extractResp.usageMetadata, params.tenant);
 
       const extracted = JSON.parse((extractResp.text ?? '{}').trim()) as VisualExtraction;
       if (extracted.isOtc || /\bOTC\b/i.test(extracted.asset || '')) {
@@ -907,7 +923,7 @@ async function runChartAnalysisUncached(params: {
           visibleIndicators: [],
         };
         const totalMs = Date.now() - tStart;
-        await recordLatency('image', totalMs);
+        await recordLatency('image', totalMs, params.tenant);
         return {
           analysis: { ...base, formattedReport: buildFormattedReport(base) },
           marketQuote: null,
@@ -923,7 +939,7 @@ async function runChartAnalysisUncached(params: {
       detectedTimeframe = extracted.timeframe || detectedTimeframe;
       chartLastPrice = typeof extracted.chartLastPrice === 'number' ? extracted.chartLastPrice : null;
     } catch (err) {
-      const safeErr = await recordGeminiFailure(err);
+      const safeErr = await recordGeminiFailure(err, params.tenant);
       throw new Error(safeErr);
     }
 
@@ -973,7 +989,7 @@ async function runChartAnalysisUncached(params: {
 
   let finalText = '{}';
   try {
-    await assertNotInRateLimitCooldown();
+    await assertNotInRateLimitCooldown(params.tenant);
     const tGemStart = Date.now();
     const pass2Contents = validateGeminiContents([
       {
@@ -992,10 +1008,10 @@ async function runChartAnalysisUncached(params: {
       },
     });
     geminiMs += Date.now() - tGemStart;
-    await recordGeminiSuccess(finalResp.usageMetadata);
+    await recordGeminiSuccess(finalResp.usageMetadata, params.tenant);
     finalText = (finalResp.text ?? '{}').trim();
   } catch (err) {
-    const safeErr = await recordGeminiFailure(err);
+    const safeErr = await recordGeminiFailure(err, params.tenant);
     throw new Error(safeErr);
   }
 
@@ -1121,11 +1137,12 @@ async function runChartAnalysisUncached(params: {
       analysis: finalAnalysis,
       marketQuote,
       origin: 'LIVE_AI',
+      tenant: params.tenant,
     }).catch(() => {});
   }
 
   const totalMs = Date.now() - tStart;
-  await recordLatency('image', totalMs);
+  await recordLatency('image', totalMs, params.tenant);
 
   return {
     analysis: finalAnalysis,
@@ -1140,6 +1157,7 @@ export async function analyzeChartImage(params: {
   userMessage?: string;
   photoReceivedAtBrt?: string;
   history?: ChatMessage[];
+  tenant?: AiTenantContext;
 }): Promise<AnalysisBundle> {
   const lastConvAsset = [...(params.history || [])]
     .reverse()
@@ -1153,19 +1171,20 @@ export async function analyzeChartImage(params: {
     params.userMessage,
     lastConvAsset,
     lastConvTf,
+    params.tenant,
   );
 
-  // 1. Return exact cached result if still valid
+  // 1. Return exact cached result if still valid within THIS isolated tenant+conversation
   const cached = analysisCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    await recordCacheHit();
+    await recordCacheHit(params.tenant);
     return cached.result;
   }
 
-  // 2. Deduplicate concurrent identical requests
+  // 2. Deduplicate concurrent identical requests within THIS isolated tenant+conversation
   const existingPromise = inFlightAnalyses.get(cacheKey);
   if (existingPromise) {
-    await recordDeduplicatedRequest();
+    await recordDeduplicatedRequest(params.tenant);
     return existingPromise;
   }
 
@@ -1203,6 +1222,7 @@ export async function continueChartChat(params: {
   userMessage: string;
   lastAsset?: string | null;
   lastTimeframe?: string | null;
+  tenant?: AiTenantContext;
 }): Promise<ChatBundle> {
   const tStart = Date.now();
   const trimmedMsg = params.userMessage.trim();
@@ -1213,7 +1233,7 @@ export async function continueChartChat(params: {
     const timeSync = await getSynchronizedBrasiliaTime(true);
     const timeSyncMs = Date.now() - tSync;
     const totalMs = Date.now() - tStart;
-    await recordLatency('text', totalMs);
+    await recordLatency('text', totalMs, params.tenant);
     return {
       replyText: `Horário oficial de Brasília agora: ${timeSync.dateBrt} às ${timeSync.timeBrt} BRT (America/Sao_Paulo).`,
       marketQuote: null,
@@ -1257,7 +1277,7 @@ export async function continueChartChat(params: {
           ? ` (${liveQuote.changePercent24h >= 0 ? '+' : ''}${liveQuote.changePercent24h.toFixed(2)}%)`
           : '';
       const totalMs = Date.now() - tStart;
-      await recordLatency('text', totalMs);
+      await recordLatency('text', totalMs, params.tenant);
       return {
         replyText: `${liveQuote.displayName}: ${liveQuote.price.toLocaleString('pt-BR', { maximumFractionDigits: 6 })} ${liveQuote.currency}${varTxt} — fonte ${liveQuote.provider} às ${liveQuote.fetchedAtBrt} BRT.`,
         marketQuote: liveQuote,
@@ -1267,30 +1287,31 @@ export async function continueChartChat(params: {
     }
   }
 
-  // Deduplicate and short-cache identical chat queries to avoid duplicate Gemini API usage
+  // Deduplicate and short-cache identical chat queries strictly within THIS isolated tenant+conversation
   const tailKey = params.messages
     .slice(-3)
     .map((m) => `${m.role}:${m.text.slice(0, 80)}`)
     .join('|');
+  const tenantScopePrefix = `${params.tenant?.companyId || '_global'}|${params.tenant?.uid || '_anon'}|${params.tenant?.projectId || '_proj'}|${params.tenant?.conversationId || '_conv'}`;
   const chatKey = crypto
     .createHash('sha256')
-    .update(`${trimmedMsg.toLowerCase()}|${targetAsset || ''}|${targetTimeframe || ''}|${tailKey}|${Boolean(lastImageMsg?.imageDataUrl)}`)
+    .update(`${tenantScopePrefix}|${trimmedMsg.toLowerCase()}|${targetAsset || ''}|${targetTimeframe || ''}|${tailKey}|${Boolean(lastImageMsg?.imageDataUrl)}`)
     .digest('hex');
 
   const cachedChat = chatCache.get(chatKey);
   if (cachedChat && cachedChat.expiresAt > Date.now()) {
-    await recordCacheHit();
+    await recordCacheHit(params.tenant);
     return cachedChat.result;
   }
 
   const pendingChat = inFlightChats.get(chatKey);
   if (pendingChat) {
-    await recordDeduplicatedRequest();
+    await recordDeduplicatedRequest(params.tenant);
     return pendingChat;
   }
 
   const execPromise = (async (): Promise<ChatBundle> => {
-    await assertNotInRateLimitCooldown();
+    await assertNotInRateLimitCooldown(params.tenant);
     const ai = getGeminiClient();
 
   // Run timeSync (cached 60s) + live market quote (cached 15s) in parallel!
@@ -1413,10 +1434,10 @@ export async function continueChartChat(params: {
       },
     });
     geminiMs = Date.now() - tGemStart;
-    await recordGeminiSuccess(resp.usageMetadata);
+    await recordGeminiSuccess(resp.usageMetadata, params.tenant);
     rawJson = (resp.text ?? '{}').trim();
   } catch (err) {
-    const safeErr = await recordGeminiFailure(err);
+    const safeErr = await recordGeminiFailure(err, params.tenant);
     throw new Error(safeErr);
   }
 
@@ -1502,12 +1523,13 @@ export async function continueChartChat(params: {
         analysis,
         marketQuote: liveQuote,
         origin: 'LIVE_AI',
+        tenant: params.tenant,
       }).catch(() => {});
     }
   }
 
   const totalMs = Date.now() - tStart;
-  await recordLatency('text', totalMs);
+  await recordLatency('text', totalMs, params.tenant);
 
     return {
       replyText: data.replyText || (analysis ? analysis.formattedReport : 'Não foi possível gerar resposta.'),

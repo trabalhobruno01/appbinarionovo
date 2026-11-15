@@ -5,10 +5,19 @@ import { createServer as createViteServer } from 'vite';
 import { analyzeChartImage, continueChartChat } from './server/aiAnalyst.ts';
 import {
   deleteConversation,
+  deleteConversationsByProject,
+  getConversationById,
   listConversations,
   saveConversation,
 } from './server/conversationStore.ts';
 import { fetchMarketQuote } from './server/marketData.ts';
+import {
+  deleteProject,
+  ensureDefaultProject,
+  getProjectById,
+  listProjects,
+  saveProject,
+} from './server/projectStore.ts';
 import {
   DEFAULT_PAYOUT_PERCENT,
   DEFAULT_TIE_RULE,
@@ -16,14 +25,73 @@ import {
   runCausalWalkForwardBacktest,
   settlePendingSignals,
 } from './server/signalValidator.ts';
+import {
+  assertNoTenantSpoofing,
+  assertResourceOwnership,
+  TenantAccessError,
+} from './server/tenantRegistry.ts';
 import { getSynchronizedBrasiliaTime } from './server/timeService.ts';
+import {
+  AuthVerificationError,
+  verifyFirebaseIdTokenHeader,
+  type VerifiedFirebaseUser,
+} from './server/firebaseAuth.ts';
 import { getUsageStats, sanitizeErrorMessage } from './server/usageTracker.ts';
 import type { ChatMessage, Conversation, TieRule } from './shared/types.ts';
+
+type AuthedRequest = express.Request & { authUser?: VerifiedFirebaseUser };
+
+async function requireFirebaseAuth(
+  req: AuthedRequest,
+  res: express.Response,
+  next: express.NextFunction,
+): Promise<void> {
+  try {
+    const user = await verifyFirebaseIdTokenHeader(req.header('authorization'));
+    req.authUser = user;
+    // Reject any cross-tenant identity spoofing in headers/query immediately
+    assertNoTenantSpoofing(
+      user,
+      [
+        req.header('x-company-id'),
+        typeof req.query.companyId === 'string' ? req.query.companyId : undefined,
+      ],
+      'companyId',
+    );
+    assertNoTenantSpoofing(
+      user,
+      [
+        req.header('x-owner-uid'),
+        typeof req.query.ownerUid === 'string' ? req.query.ownerUid : undefined,
+        typeof req.query.uid === 'string' ? req.query.uid : undefined,
+      ],
+      'uid',
+    );
+    next();
+  } catch (err) {
+    const status =
+      err instanceof AuthVerificationError || err instanceof TenantAccessError ? err.status : 401;
+    const message =
+      err instanceof AuthVerificationError || err instanceof TenantAccessError
+        ? err.message
+        : 'Autenticação necessária.';
+    res.status(status).json({ error: message });
+  }
+}
+
+function sendError(res: express.Response, err: unknown, fallbackStatus = 500, fallbackMsg = 'Erro interno.'): void {
+  if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  const msg = err instanceof Error ? sanitizeErrorMessage(err.message) : fallbackMsg;
+  res.status(fallbackStatus).json({ error: msg });
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024; // ~5MB limit on payload
 
-// Simple in-flight dedup map to avoid duplicate rapid submissions
+// Simple in-flight dedup map scoped per authenticated user UID
 const activeRequests = new Map<string, number>();
 
 function checkImageValid(dataUrl: unknown): { ok: boolean; error?: string } {
@@ -54,14 +122,27 @@ async function startServer() {
     res.json({ ok: true, service: 'chartpulse-ai' });
   });
 
-  app.get('/api/usage', async (_req, res) => {
+  app.get('/api/session', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
-      const usage = await getUsageStats();
+      const authUser = req.authUser!;
+      await ensureDefaultProject(authUser);
+      res.json({
+        uid: authUser.uid,
+        email: authUser.email,
+        companyId: authUser.companyId,
+      });
+    } catch (err) {
+      sendError(res, err, 500, 'Erro ao carregar sessão do usuário.');
+    }
+  });
+
+  app.get('/api/usage', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const authUser = req.authUser!;
+      const usage = await getUsageStats({ uid: authUser.uid, companyId: authUser.companyId });
       res.json(usage);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? sanitizeErrorMessage(err.message) : 'Erro ao consultar consumo.',
-      });
+      sendError(res, err, 500, 'Erro ao consultar consumo.');
     }
   });
 
@@ -76,7 +157,7 @@ async function startServer() {
     }
   });
 
-  app.get('/api/quote', async (req, res) => {
+  app.get('/api/quote', requireFirebaseAuth, async (req, res) => {
     try {
       const symbol = typeof req.query.symbol === 'string' ? req.query.symbol : '';
       const timeframe = typeof req.query.timeframe === 'string' ? req.query.timeframe : '15m';
@@ -93,9 +174,66 @@ async function startServer() {
     }
   });
 
-  app.post('/api/analyze', async (req, res) => {
-    const clientToken = req.header('x-client-token') || 'anon';
-    const requestKey = `${clientToken}:analyze`;
+  app.get('/api/projects', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const projects = await listProjects(req.authUser!);
+      res.json({ projects });
+    } catch (err) {
+      sendError(res, err, 500, 'Erro ao carregar projetos.');
+    }
+  });
+
+  app.get('/api/projects/:id', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const project = await getProjectById(req.authUser!, req.params.id);
+      res.json({ project });
+    } catch (err) {
+      sendError(res, err, 500, 'Erro ao carregar projeto.');
+    }
+  });
+
+  app.post('/api/projects', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const authUser = req.authUser!;
+      const body = (req.body || {}) as {
+        id?: string;
+        name?: string;
+        description?: string;
+        defaultAsset?: string | null;
+        defaultTimeframe?: string | null;
+        companyId?: string;
+        ownerUid?: string;
+        uid?: string;
+      };
+      assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
+      assertNoTenantSpoofing(authUser, [body.ownerUid, body.uid], 'uid');
+      const project = await saveProject(authUser, {
+        id: body.id,
+        name: body.name || '',
+        description: body.description,
+        defaultAsset: body.defaultAsset,
+        defaultTimeframe: body.defaultTimeframe,
+      });
+      res.json({ project });
+    } catch (err) {
+      sendError(res, err, 400, 'Erro ao salvar projeto.');
+    }
+  });
+
+  app.delete('/api/projects/:id', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const authUser = req.authUser!;
+      await deleteProject(authUser, req.params.id);
+      await deleteConversationsByProject(authUser, req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      sendError(res, err, 400, 'Erro ao excluir projeto.');
+    }
+  });
+
+  app.post('/api/analyze', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    const authUser = req.authUser!;
+    const requestKey = `${authUser.companyId}:${authUser.uid}:analyze`;
     const now = Date.now();
     const prevStart = activeRequests.get(requestKey);
     if (prevStart && now - prevStart < 2500) {
@@ -105,14 +243,38 @@ async function startServer() {
     activeRequests.set(requestKey, now);
 
     try {
-      const { imageDataUrl, userMessage, photoReceivedAtBrt, history } = req.body as {
+      const body = req.body as {
         imageDataUrl?: string;
         userMessage?: string;
         photoReceivedAtBrt?: string;
         history?: ChatMessage[];
+        projectId?: string;
+        conversationId?: string;
+        companyId?: string;
+        ownerUid?: string;
       };
 
-      const check = checkImageValid(imageDataUrl);
+      assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
+      assertNoTenantSpoofing(authUser, [body.ownerUid], 'uid');
+
+      if (body.projectId) {
+        await assertResourceOwnership({
+          kind: 'projects',
+          resourceId: body.projectId,
+          authUser,
+          allowUnregistered: false,
+        });
+      }
+      if (body.conversationId) {
+        await assertResourceOwnership({
+          kind: 'conversations',
+          resourceId: body.conversationId,
+          authUser,
+          allowUnregistered: true,
+        });
+      }
+
+      const check = checkImageValid(body.imageDataUrl);
       if (!check.ok) {
         res.status(400).json({ error: check.error });
         return;
@@ -124,16 +286,26 @@ async function startServer() {
 
       const result = await Promise.race([
         analyzeChartImage({
-          imageDataUrl: imageDataUrl!,
-          userMessage,
-          photoReceivedAtBrt,
-          history,
+          imageDataUrl: body.imageDataUrl!,
+          userMessage: body.userMessage,
+          photoReceivedAtBrt: body.photoReceivedAtBrt,
+          history: body.history,
+          tenant: {
+            uid: authUser.uid,
+            companyId: authUser.companyId,
+            projectId: body.projectId,
+            conversationId: body.conversationId,
+          },
         }),
         timeoutPromise,
       ]);
 
       res.json(result);
     } catch (err) {
+      if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+        res.status(err.status).json({ error: err.message });
+        return;
+      }
       const rawMsg = err instanceof Error ? err.message : 'Erro interno ao analisar imagem.';
       const message = sanitizeErrorMessage(rawMsg);
       const status = message.includes('GEMINI_API_KEY')
@@ -147,9 +319,9 @@ async function startServer() {
     }
   });
 
-  app.post('/api/chat', async (req, res) => {
-    const clientToken = req.header('x-client-token') || 'anon';
-    const requestKey = `${clientToken}:chat`;
+  app.post('/api/chat', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    const authUser = req.authUser!;
+    const requestKey = `${authUser.companyId}:${authUser.uid}:chat`;
     const now = Date.now();
     const prevStart = activeRequests.get(requestKey);
     if (prevStart && now - prevStart < 1500) {
@@ -159,14 +331,38 @@ async function startServer() {
     activeRequests.set(requestKey, now);
 
     try {
-      const { messages, userMessage, lastAsset, lastTimeframe } = req.body as {
+      const body = req.body as {
         messages?: ChatMessage[];
         userMessage?: string;
         lastAsset?: string | null;
         lastTimeframe?: string | null;
+        projectId?: string;
+        conversationId?: string;
+        companyId?: string;
+        ownerUid?: string;
       };
 
-      if (!userMessage || !userMessage.trim()) {
+      assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
+      assertNoTenantSpoofing(authUser, [body.ownerUid], 'uid');
+
+      if (body.projectId) {
+        await assertResourceOwnership({
+          kind: 'projects',
+          resourceId: body.projectId,
+          authUser,
+          allowUnregistered: false,
+        });
+      }
+      if (body.conversationId) {
+        await assertResourceOwnership({
+          kind: 'conversations',
+          resourceId: body.conversationId,
+          authUser,
+          allowUnregistered: true,
+        });
+      }
+
+      if (!body.userMessage || !body.userMessage.trim()) {
         res.status(400).json({ error: 'Mensagem vazia.' });
         return;
       }
@@ -177,16 +373,26 @@ async function startServer() {
 
       const result = await Promise.race([
         continueChartChat({
-          messages: Array.isArray(messages) ? messages : [],
-          userMessage: userMessage.trim(),
-          lastAsset,
-          lastTimeframe,
+          messages: Array.isArray(body.messages) ? body.messages : [],
+          userMessage: body.userMessage.trim(),
+          lastAsset: body.lastAsset,
+          lastTimeframe: body.lastTimeframe,
+          tenant: {
+            uid: authUser.uid,
+            companyId: authUser.companyId,
+            projectId: body.projectId,
+            conversationId: body.conversationId,
+          },
         }),
         timeoutPromise,
       ]);
 
       res.json(result);
     } catch (err) {
+      if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+        res.status(err.status).json({ error: err.message });
+        return;
+      }
       const rawMsg = err instanceof Error ? err.message : 'Erro ao processar conversa.';
       const message = sanitizeErrorMessage(rawMsg);
       const status = message.includes('GEMINI_API_KEY')
@@ -200,71 +406,86 @@ async function startServer() {
     }
   });
 
-  app.get('/api/conversations', async (req, res) => {
+  app.get('/api/conversations', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
-      const clientId = req.header('x-client-token') || 'default';
-      const list = await listConversations(clientId);
+      const projectId =
+        typeof req.query.projectId === 'string' && req.query.projectId.trim()
+          ? req.query.projectId.trim()
+          : undefined;
+      const list = await listConversations(req.authUser!, projectId);
       res.json({ conversations: list });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Erro ao carregar histórico.' });
+      sendError(res, err, 500, 'Erro ao carregar histórico.');
     }
   });
 
-  app.post('/api/conversations', async (req, res) => {
+  app.get('/api/conversations/:id', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
-      const clientId = req.header('x-client-token') || 'default';
+      const conversation = await getConversationById(req.authUser!, req.params.id);
+      res.json({ conversation });
+    } catch (err) {
+      sendError(res, err, 500, 'Erro ao consultar conversa.');
+    }
+  });
+
+  app.post('/api/conversations', requireFirebaseAuth, async (req: AuthedRequest, res) => {
+    try {
+      const authUser = req.authUser!;
       const conv = req.body as Conversation;
+      assertNoTenantSpoofing(authUser, [conv?.companyId], 'companyId');
+      assertNoTenantSpoofing(authUser, [conv?.ownerUid], 'uid');
       if (!conv || !conv.id) {
         res.status(400).json({ error: 'Conversa inválida.' });
         return;
       }
-      const saved = await saveConversation(clientId, conv);
+      const saved = await saveConversation(authUser, conv);
       res.json({ conversation: saved });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Erro ao salvar conversa.' });
+      sendError(res, err, 500, 'Erro ao salvar conversa.');
     }
   });
 
-  app.delete('/api/conversations/:id', async (req, res) => {
+  app.delete('/api/conversations/:id', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
-      const clientId = req.header('x-client-token') || 'default';
-      await deleteConversation(clientId, req.params.id);
+      await deleteConversation(req.authUser!, req.params.id);
       res.json({ ok: true });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Erro ao excluir conversa.' });
+      sendError(res, err, 500, 'Erro ao excluir conversa.');
     }
   });
 
-  app.get('/api/signals', async (req, res) => {
+  app.get('/api/signals', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
+      const authUser = req.authUser!;
       const payout = Number(req.query.payout) || DEFAULT_PAYOUT_PERCENT;
       const tieRule: TieRule = req.query.tieRule === 'LOSS' ? 'LOSS' : DEFAULT_TIE_RULE;
       const settle = req.query.settle !== 'false';
-      const summary = await getValidationSummary(payout, tieRule, settle);
+      const summary = await getValidationSummary(payout, tieRule, settle, {
+        uid: authUser.uid,
+        companyId: authUser.companyId,
+      });
       res.json(summary);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? sanitizeErrorMessage(err.message) : 'Erro ao carregar auditoria de sinais.',
-      });
+      sendError(res, err, 500, 'Erro ao carregar auditoria de sinais.');
     }
   });
 
-  app.post('/api/signals/settle', async (req, res) => {
+  app.post('/api/signals/settle', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
+      const authUser = req.authUser!;
       const body = (req.body || {}) as { payoutPercent?: number; tieRule?: TieRule };
       const payout = Number(body.payoutPercent) || DEFAULT_PAYOUT_PERCENT;
       const tieRule: TieRule = body.tieRule === 'LOSS' ? 'LOSS' : DEFAULT_TIE_RULE;
-      const settled = await settlePendingSignals(payout, tieRule);
-      const summary = await getValidationSummary(payout, tieRule, false);
+      const tenant = { uid: authUser.uid, companyId: authUser.companyId };
+      const settled = await settlePendingSignals(payout, tieRule, tenant);
+      const summary = await getValidationSummary(payout, tieRule, false, tenant);
       res.json({ ...settled, summary });
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? sanitizeErrorMessage(err.message) : 'Erro ao liquidar sinais vencidos.',
-      });
+      sendError(res, err, 500, 'Erro ao liquidar sinais vencidos.');
     }
   });
 
-  app.post('/api/signals/backtest', async (req, res) => {
+  app.post('/api/signals/backtest', requireFirebaseAuth, async (req, res) => {
     try {
       const body = (req.body || {}) as {
         symbol?: string;
@@ -287,6 +508,10 @@ async function startServer() {
         error: err instanceof Error ? sanitizeErrorMessage(err.message) : 'Erro ao executar backtest histórico.',
       });
     }
+  });
+
+  app.all('/api/*', requireFirebaseAuth, (_req, res) => {
+    res.status(404).json({ error: 'Endpoint de API não encontrado.' });
   });
 
   // Vite middleware in dev, static dist in production

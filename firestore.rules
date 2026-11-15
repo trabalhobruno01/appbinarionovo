@@ -1,0 +1,409 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function userDocExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function callerCompanyId() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.companyId;
+    }
+
+    function isCallerCompany(companyId) {
+      return isSignedIn() && userDocExists() && callerCompanyId() == companyId;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'companyId', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'companyId', 'email', 'role', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isValidId(data.companyId)
+        && data.role in ['owner', 'member']
+        && (!('email' in data) || (data.email is string && data.email.size() <= 254))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompany(data) {
+      return data.keys().hasAll(['companyId', 'ownerUid', 'name', 'createdAt'])
+        && data.keys().hasOnly(['companyId', 'ownerUid', 'name', 'createdAt'])
+        && isValidId(data.companyId)
+        && isValidId(data.ownerUid)
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'companyId', 'name', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'companyId',
+          'name',
+          'description',
+          'defaultAsset',
+          'defaultTimeframe',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.companyId)
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 100
+        && (!('description' in data) || (data.description is string && data.description.size() <= 300))
+        && (!('defaultAsset' in data) || (data.defaultAsset is string && data.defaultAsset.size() <= 40))
+        && (!('defaultTimeframe' in data) || (data.defaultTimeframe is string && data.defaultTimeframe.size() <= 16))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidConversation(data) {
+      return data.keys().hasAll([
+        'id',
+        'ownerUid',
+        'companyId',
+        'projectId',
+        'title',
+        'updatedAtBrt',
+        'messageCount',
+        'createdAt',
+        'updatedAt'
+      ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'companyId',
+          'projectId',
+          'title',
+          'lastAsset',
+          'lastTimeframe',
+          'updatedAtBrt',
+          'messageCount',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.companyId)
+        && isValidId(data.projectId)
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 160
+        && (!('lastAsset' in data) || (data.lastAsset is string && data.lastAsset.size() <= 64))
+        && (!('lastTimeframe' in data) || (data.lastTimeframe is string && data.lastTimeframe.size() <= 16))
+        && data.updatedAtBrt is string
+        && data.updatedAtBrt.size() <= 32
+        && data.messageCount is number
+        && data.messageCount >= 0
+        && data.messageCount <= 5000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll([
+        'id',
+        'ownerUid',
+        'companyId',
+        'projectId',
+        'conversationId',
+        'role',
+        'text',
+        'createdAtBrt',
+        'createdAt'
+      ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'companyId',
+          'projectId',
+          'conversationId',
+          'role',
+          'text',
+          'storagePath',
+          'createdAtBrt',
+          'createdAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.companyId)
+        && isValidId(data.projectId)
+        && isValidId(data.conversationId)
+        && data.role in ['user', 'assistant']
+        && data.text is string
+        && data.text.size() <= 20000
+        && (!('storagePath' in data) || (data.storagePath is string && data.storagePath.size() <= 300))
+        && data.createdAtBrt is string
+        && data.createdAtBrt.size() <= 32
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSignalRecord(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'companyId', 'asset', 'direction', 'timeframe', 'status', 'createdAt'])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'companyId',
+          'projectId',
+          'asset',
+          'direction',
+          'timeframe',
+          'status',
+          'createdAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.companyId)
+        && (!('projectId' in data) || isValidId(data.projectId))
+        && data.asset is string
+        && data.asset.size() >= 1
+        && data.asset.size() <= 64
+        && data.direction in ['COMPRA', 'VENDA']
+        && data.timeframe is string
+        && data.timeframe.size() >= 1
+        && data.timeframe.size() <= 16
+        && data.status in ['PENDENTE', 'GANHO', 'PERDA', 'EMPATE', 'SEM_DADOS']
+        && data.createdAt is timestamp;
+    }
+
+    // 1. User tenant binding (immutable companyId; cannot assume another user's companyId)
+    match /users/{userId} {
+      allow get: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && existing().uid == request.auth.uid;
+      allow list: if false;
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && !exists(/databases/$(database)/documents/users/$(userId))
+        && isValidUserProfile(incoming())
+        && incoming().uid == request.auth.uid
+        && incoming().companyId == ('cmp_' + request.auth.uid)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // 2. Company tenant root
+    match /companies/{companyId} {
+      allow get: if isSignedIn()
+        && isValidId(companyId)
+        && existing().ownerUid == request.auth.uid
+        && existing().companyId == companyId
+        && isCallerCompany(companyId);
+      allow list: if isSignedIn()
+        && existing().ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(companyId)
+        && isValidCompany(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().companyId == companyId
+        && incoming().createdAt == request.time
+        && ((userDocExists() && callerCompanyId() == companyId)
+          || (!userDocExists() && companyId == ('cmp_' + request.auth.uid)));
+      allow update, delete: if false;
+
+      // 3. Projects strictly isolated per (companyId, ownerUid)
+      match /projects/{projectId} {
+        allow get: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(projectId)
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId
+          && isCallerCompany(companyId);
+        allow list: if isSignedIn()
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId;
+        allow create: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(projectId)
+          && isCallerCompany(companyId)
+          && exists(/databases/$(database)/documents/companies/$(companyId))
+          && isValidProject(incoming())
+          && incoming().id == projectId
+          && incoming().ownerUid == request.auth.uid
+          && incoming().companyId == companyId
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(projectId)
+          && isCallerCompany(companyId)
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId
+          && isValidProject(incoming())
+          && incoming().id == existing().id
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().companyId == existing().companyId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'description',
+            'defaultAsset',
+            'defaultTimeframe',
+            'updatedAt'
+          ]);
+        allow delete: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(projectId)
+          && isCallerCompany(companyId)
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId;
+
+        // 4. Conversations strictly bound to (companyId, projectId, ownerUid)
+        match /conversations/{conversationId} {
+          allow get: if isSignedIn()
+            && isValidId(companyId)
+            && isValidId(projectId)
+            && isValidId(conversationId)
+            && existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+            && existing().projectId == projectId
+            && isCallerCompany(companyId);
+          allow list: if isSignedIn()
+            && existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+            && existing().projectId == projectId;
+          allow create: if isSignedIn()
+            && isValidId(companyId)
+            && isValidId(projectId)
+            && isValidId(conversationId)
+            && isCallerCompany(companyId)
+            && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)).data.ownerUid == request.auth.uid
+            && isValidConversation(incoming())
+            && incoming().id == conversationId
+            && incoming().ownerUid == request.auth.uid
+            && incoming().companyId == companyId
+            && incoming().projectId == projectId
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time;
+          allow update: if isSignedIn()
+            && isValidId(companyId)
+            && isValidId(projectId)
+            && isValidId(conversationId)
+            && isCallerCompany(companyId)
+            && existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+            && existing().projectId == projectId
+            && isValidConversation(incoming())
+            && incoming().id == existing().id
+            && incoming().ownerUid == existing().ownerUid
+            && incoming().companyId == existing().companyId
+            && incoming().projectId == existing().projectId
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'title',
+              'lastAsset',
+              'lastTimeframe',
+              'updatedAtBrt',
+              'updatedAt',
+              'messageCount'
+            ]);
+          allow delete: if isSignedIn()
+            && isValidId(companyId)
+            && isValidId(projectId)
+            && isValidId(conversationId)
+            && isCallerCompany(companyId)
+            && existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+            && existing().projectId == projectId;
+
+          // 5. Messages strictly bound to parent conversation owner
+          match /messages/{messageId} {
+            allow get: if isSignedIn()
+              && isValidId(companyId)
+              && isValidId(projectId)
+              && isValidId(conversationId)
+              && isValidId(messageId)
+              && existing().ownerUid == request.auth.uid
+              && existing().companyId == companyId
+              && existing().projectId == projectId
+              && existing().conversationId == conversationId
+              && isCallerCompany(companyId);
+            allow list: if isSignedIn()
+              && existing().ownerUid == request.auth.uid
+              && existing().companyId == companyId
+              && existing().projectId == projectId
+              && existing().conversationId == conversationId;
+            allow create: if isSignedIn()
+              && isValidId(companyId)
+              && isValidId(projectId)
+              && isValidId(conversationId)
+              && isValidId(messageId)
+              && isCallerCompany(companyId)
+              && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)/conversations/$(conversationId)).data.ownerUid == request.auth.uid
+              && isValidMessage(incoming())
+              && incoming().id == messageId
+              && incoming().ownerUid == request.auth.uid
+              && incoming().companyId == companyId
+              && incoming().projectId == projectId
+              && incoming().conversationId == conversationId
+              && incoming().createdAt == request.time;
+            allow update: if false;
+            allow delete: if isSignedIn()
+              && isValidId(companyId)
+              && isValidId(projectId)
+              && isValidId(conversationId)
+              && isValidId(messageId)
+              && isCallerCompany(companyId)
+              && existing().ownerUid == request.auth.uid
+              && existing().companyId == companyId
+              && existing().conversationId == conversationId;
+          }
+        }
+      }
+
+      // 6. Private signal records per user/company
+      match /signals/{signalId} {
+        allow get: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(signalId)
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId
+          && isCallerCompany(companyId);
+        allow list: if isSignedIn()
+          && existing().ownerUid == request.auth.uid
+          && existing().companyId == companyId;
+        allow create: if isSignedIn()
+          && isValidId(companyId)
+          && isValidId(signalId)
+          && isCallerCompany(companyId)
+          && isValidSignalRecord(incoming())
+          && incoming().id == signalId
+          && incoming().ownerUid == request.auth.uid
+          && incoming().companyId == companyId
+          && incoming().createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

@@ -108,8 +108,29 @@ export interface ChatMessage {
   error?: boolean;
 }
 
+export interface TenantSessionInfo {
+  uid: string;
+  email: string | null;
+  companyId: string;
+}
+
+export interface Project {
+  id: string;
+  ownerUid: string;
+  companyId: string;
+  name: string;
+  description?: string;
+  defaultAsset?: string | null;
+  defaultTimeframe?: string | null;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
 export interface Conversation {
   id: string;
+  ownerUid?: string;
+  companyId?: string;
+  projectId?: string;
   title: string;
   lastAsset?: string | null;
   lastTimeframe?: string | null;
@@ -124,6 +145,9 @@ export type TieRule = 'REFUND' | 'LOSS';
 
 export interface SignalRecord {
   id: string;
+  ownerUid?: string;
+  companyId?: string;
+  projectId?: string;
   origin: 'LIVE_AI' | 'DEMO_ACCOUNT';
   asset: string;
   normalizedSymbol: string | null;

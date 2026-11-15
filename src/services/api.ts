@@ -4,17 +4,44 @@ import type {
   ChatMessage,
   Conversation,
   MarketQuote,
+  Project,
   SignalValidationSummary,
+  TenantSessionInfo,
   TieRule,
   WalkForwardBacktestResult,
 } from '../../shared/types.ts';
+import { getFreshIdToken } from './firebase.ts';
 import { getClientToken } from './storage.ts';
 
-function getHeaders(): Record<string, string> {
-  return {
+type UnauthorizedHandler = () => void;
+let onUnauthorizedHandler: UnauthorizedHandler | null = null;
+const pendingSessionControllers = new Set<AbortController>();
+
+export function registerUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  onUnauthorizedHandler = handler;
+}
+
+export function abortPendingApiRequests(): void {
+  for (const controller of pendingSessionControllers) {
+    try {
+      controller.abort();
+    } catch {
+      // Ignore
+    }
+  }
+  pendingSessionControllers.clear();
+}
+
+async function getAuthHeaders(forceRefresh = false): Promise<Record<string, string>> {
+  const token = await getFreshIdToken(forceRefresh);
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Client-Token': getClientToken(),
   };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
 }
 
 async function parseApiResponse<T>(res: Response): Promise<T> {
@@ -37,25 +64,93 @@ async function parseApiResponse<T>(res: Response): Promise<T> {
 }
 
 export async function fetchBrasiliaTime(): Promise<BrasiliaTimeSync> {
-  const res = await fetch('/api/time', { headers: getHeaders() });
+  const res = await fetch('/api/time', {
+    headers: { 'Content-Type': 'application/json', 'X-Client-Token': getClientToken() },
+  });
   return parseApiResponse<BrasiliaTimeSync>(res);
 }
 
 const API_TIMEOUT_MS = 45_000;
 
-async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs = API_TIMEOUT_MS): Promise<Response> {
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs = API_TIMEOUT_MS,
+): Promise<Response> {
   const controller = new AbortController();
+  pendingSessionControllers.add(controller);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error('Tempo limite de resposta excedido. Tente novamente.');
+      throw new Error('Operação cancelada ou tempo limite excedido.');
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    pendingSessionControllers.delete(controller);
   }
+}
+
+async function authenticatedFetch(
+  input: RequestInfo | URL,
+  init: Omit<RequestInit, 'headers'> = {},
+  timeoutMs = API_TIMEOUT_MS,
+): Promise<Response> {
+  const headers = await getAuthHeaders(false);
+  let res = await fetchWithTimeout(input, { ...init, headers }, timeoutMs);
+
+  if (res.status === 401) {
+    const freshHeaders = await getAuthHeaders(true);
+    if (freshHeaders.Authorization) {
+      res = await fetchWithTimeout(input, { ...init, headers: freshHeaders }, timeoutMs);
+    }
+    if (res.status === 401) {
+      onUnauthorizedHandler?.();
+    }
+  }
+
+  return res;
+}
+
+export async function fetchTenantSession(): Promise<TenantSessionInfo> {
+  const res = await authenticatedFetch('/api/session', {}, 15_000);
+  return parseApiResponse<TenantSessionInfo>(res);
+}
+
+export async function fetchRemoteProjects(): Promise<Project[]> {
+  const res = await authenticatedFetch('/api/projects', {}, 15_000);
+  const data = await parseApiResponse<{ projects?: Project[] }>(res);
+  return Array.isArray(data.projects) ? data.projects : [];
+}
+
+export async function saveRemoteProject(input: {
+  id?: string;
+  name: string;
+  description?: string;
+  defaultAsset?: string | null;
+  defaultTimeframe?: string | null;
+}): Promise<Project> {
+  const res = await authenticatedFetch(
+    '/api/projects',
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+    },
+    15_000,
+  );
+  const data = await parseApiResponse<{ project: Project }>(res);
+  return data.project;
+}
+
+export async function deleteRemoteProject(id: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/api/projects/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+    15_000,
+  );
+  await parseApiResponse<{ ok: boolean }>(res);
 }
 
 function compactMessagesForChat(messages: ChatMessage[], userMessage: string): ChatMessage[] {
@@ -86,6 +181,8 @@ export async function analyzeChartRequest(payload: {
   userMessage?: string;
   photoReceivedAtBrt?: string;
   history?: ChatMessage[];
+  projectId?: string;
+  conversationId?: string;
 }): Promise<{
   analysis: ChartAnalysisResult;
   marketQuote: MarketQuote | null;
@@ -97,9 +194,8 @@ export async function analyzeChartRequest(payload: {
     marketQuote: undefined,
   }));
 
-  const res = await fetchWithTimeout('/api/analyze', {
+  const res = await authenticatedFetch('/api/analyze', {
     method: 'POST',
-    headers: getHeaders(),
     body: JSON.stringify({
       ...payload,
       history: compactHistory,
@@ -113,15 +209,16 @@ export async function sendChatFollowUp(payload: {
   userMessage: string;
   lastAsset?: string | null;
   lastTimeframe?: string | null;
+  projectId?: string;
+  conversationId?: string;
 }): Promise<{
   replyText: string;
   analysis?: ChartAnalysisResult;
   marketQuote: MarketQuote | null;
   timeSync: BrasiliaTimeSync;
 }> {
-  const res = await fetchWithTimeout('/api/chat', {
+  const res = await authenticatedFetch('/api/chat', {
     method: 'POST',
-    headers: getHeaders(),
     body: JSON.stringify({
       ...payload,
       messages: compactMessagesForChat(payload.messages, payload.userMessage),
@@ -130,9 +227,10 @@ export async function sendChatFollowUp(payload: {
   return parseApiResponse(res);
 }
 
-export async function fetchRemoteConversations(): Promise<Conversation[]> {
+export async function fetchRemoteConversations(projectId?: string): Promise<Conversation[]> {
   try {
-    const res = await fetch('/api/conversations', { headers: getHeaders() });
+    const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+    const res = await authenticatedFetch(`/api/conversations${qs}`, {}, 15_000);
     const data = await parseApiResponse<{ conversations?: Conversation[] }>(res);
     return Array.isArray(data.conversations) ? data.conversations : [];
   } catch {
@@ -142,11 +240,14 @@ export async function fetchRemoteConversations(): Promise<Conversation[]> {
 
 export async function saveRemoteConversation(conv: Conversation): Promise<void> {
   try {
-    await fetch('/api/conversations', {
-      method: 'POST',
-      headers: getHeaders(),
-      body: JSON.stringify(conv),
-    });
+    await authenticatedFetch(
+      '/api/conversations',
+      {
+        method: 'POST',
+        body: JSON.stringify(conv),
+      },
+      15_000,
+    );
   } catch {
     // IndexedDB remains source of truth if offline
   }
@@ -154,10 +255,11 @@ export async function saveRemoteConversation(conv: Conversation): Promise<void> 
 
 export async function deleteRemoteConversation(id: string): Promise<void> {
   try {
-    await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      headers: getHeaders(),
-    });
+    await authenticatedFetch(
+      `/api/conversations/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+      15_000,
+    );
   } catch {
     // Ignore network failures during delete
   }
@@ -167,9 +269,9 @@ export async function fetchSignalAudit(
   payoutPercent = 80,
   tieRule: TieRule = 'REFUND',
 ): Promise<SignalValidationSummary> {
-  const res = await fetchWithTimeout(
+  const res = await authenticatedFetch(
     `/api/signals?payout=${encodeURIComponent(payoutPercent)}&tieRule=${encodeURIComponent(tieRule)}`,
-    { headers: getHeaders() },
+    {},
     20_000,
   );
   return parseApiResponse<SignalValidationSummary>(res);
@@ -179,11 +281,10 @@ export async function settleExpiredSignals(
   payoutPercent = 80,
   tieRule: TieRule = 'REFUND',
 ): Promise<{ settledNow: number; stillPending: number; summary: SignalValidationSummary }> {
-  const res = await fetchWithTimeout(
+  const res = await authenticatedFetch(
     '/api/signals/settle',
     {
       method: 'POST',
-      headers: getHeaders(),
       body: JSON.stringify({ payoutPercent, tieRule }),
     },
     25_000,
@@ -198,11 +299,10 @@ export async function runHistoricalBacktest(params: {
   payoutPercent: number;
   tieRule: TieRule;
 }): Promise<WalkForwardBacktestResult> {
-  const res = await fetchWithTimeout(
+  const res = await authenticatedFetch(
     '/api/signals/backtest',
     {
       method: 'POST',
-      headers: getHeaders(),
       body: JSON.stringify(params),
     },
     25_000,

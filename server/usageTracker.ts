@@ -1,8 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { getTenantScopeKey, getTenantStorageDir } from './tenantRegistry.ts';
 import { formatTimestampBrt } from './timeService.ts';
 
 export const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
+export interface TenantRef {
+  uid: string;
+  companyId: string;
+}
 
 export interface UsageStats {
   model: string;
@@ -32,58 +38,75 @@ export interface UsageStats {
   _textCount: number;
 }
 
-const stats: UsageStats = {
-  model: GEMINI_MODEL,
-  thinkingLevel: 'MINIMAL',
-  apiKeyConfigured: false,
-  totalCalls: 0,
-  successfulCalls: 0,
-  failedCalls: 0,
-  rateLimitErrors429: 0,
-  cacheHits: 0,
-  deduplicatedRequests: 0,
-  quoteApiCalls: 0,
-  quoteCacheHits: 0,
-  promptTokens: 0,
-  candidatesTokens: 0,
-  totalTokens: 0,
-  avgResponseMs: 0,
-  avgImageAnalysisMs: 0,
-  avgTextChatMs: 0,
-  lastImageAnalysisMs: null,
-  lastTextChatMs: null,
-  lastCallAtBrt: null,
-  lastError: null,
-  cooldownUntilMs: 0,
-  cooldownUntilBrt: null,
-  _imageCount: 0,
-  _textCount: 0,
-};
-
-let loaded = false;
-
-function getStatsFilePath(): string {
-  if (process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME) {
-    return '/tmp/chartpulse-usage-stats.json';
-  }
-  return path.resolve(process.cwd(), '.data', 'usage-stats.json');
+function createEmptyStats(): UsageStats {
+  return {
+    model: GEMINI_MODEL,
+    thinkingLevel: 'MINIMAL',
+    apiKeyConfigured: false,
+    totalCalls: 0,
+    successfulCalls: 0,
+    failedCalls: 0,
+    rateLimitErrors429: 0,
+    cacheHits: 0,
+    deduplicatedRequests: 0,
+    quoteApiCalls: 0,
+    quoteCacheHits: 0,
+    promptTokens: 0,
+    candidatesTokens: 0,
+    totalTokens: 0,
+    avgResponseMs: 0,
+    avgImageAnalysisMs: 0,
+    avgTextChatMs: 0,
+    lastImageAnalysisMs: null,
+    lastTextChatMs: null,
+    lastCallAtBrt: null,
+    lastError: null,
+    cooldownUntilMs: 0,
+    cooldownUntilBrt: null,
+    _imageCount: 0,
+    _textCount: 0,
+  };
 }
 
-async function ensureLoaded(): Promise<void> {
-  if (loaded) return;
-  loaded = true;
-  try {
-    const raw = await fs.readFile(getStatsFilePath(), 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<UsageStats>;
-    Object.assign(stats, parsed, { model: GEMINI_MODEL, thinkingLevel: 'MINIMAL' });
-  } catch {
-    // Start fresh
+const tenantStatsMap = new Map<string, UsageStats>();
+const loadedScopes = new Set<string>();
+
+function resolveScope(tenant?: TenantRef): { key: string; filePath: string } {
+  if (tenant?.uid && tenant?.companyId) {
+    return {
+      key: getTenantScopeKey(tenant.companyId, tenant.uid),
+      filePath: path.join(getTenantStorageDir(tenant.companyId, tenant.uid), 'usage-stats.json'),
+    };
   }
+  const fallbackPath =
+    process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
+      ? '/tmp/chartpulse-usage-stats.json'
+      : path.resolve(process.cwd(), '.data', 'usage-stats.json');
+  return { key: '_system', filePath: fallbackPath };
 }
 
-async function persistStats(): Promise<void> {
+async function ensureLoaded(tenant?: TenantRef): Promise<{ stats: UsageStats; filePath: string }> {
+  const { key, filePath } = resolveScope(tenant);
+  let current = tenantStatsMap.get(key);
+  if (!current) {
+    current = createEmptyStats();
+    tenantStatsMap.set(key, current);
+  }
+  if (!loadedScopes.has(key)) {
+    loadedScopes.add(key);
+    try {
+      const raw = await fs.readFile(filePath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<UsageStats>;
+      Object.assign(current, parsed, { model: GEMINI_MODEL, thinkingLevel: 'MINIMAL' });
+    } catch {
+      // Start fresh for this tenant
+    }
+  }
+  return { stats: current, filePath };
+}
+
+async function persistStats(filePath: string, stats: UsageStats): Promise<void> {
   try {
-    const filePath = getStatsFilePath();
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(filePath, JSON.stringify(stats, null, 2), 'utf-8');
   } catch {
@@ -120,8 +143,8 @@ export function extractRetryDelayMs(errorMessage: string): number {
   return 60_000;
 }
 
-export async function assertNotInRateLimitCooldown(): Promise<void> {
-  await ensureLoaded();
+export async function assertNotInRateLimitCooldown(tenant?: TenantRef): Promise<void> {
+  const { stats } = await ensureLoaded(tenant);
   const now = Date.now();
   if (stats.cooldownUntilMs > now) {
     const waitSec = Math.max(1, Math.ceil((stats.cooldownUntilMs - now) / 1000));
@@ -131,20 +154,20 @@ export async function assertNotInRateLimitCooldown(): Promise<void> {
   }
 }
 
-export async function recordCacheHit(): Promise<void> {
-  await ensureLoaded();
+export async function recordCacheHit(tenant?: TenantRef): Promise<void> {
+  const { stats, filePath } = await ensureLoaded(tenant);
   stats.cacheHits += 1;
-  await persistStats();
+  await persistStats(filePath, stats);
 }
 
-export async function recordDeduplicatedRequest(): Promise<void> {
-  await ensureLoaded();
+export async function recordDeduplicatedRequest(tenant?: TenantRef): Promise<void> {
+  const { stats, filePath } = await ensureLoaded(tenant);
   stats.deduplicatedRequests += 1;
-  await persistStats();
+  await persistStats(filePath, stats);
 }
 
-export async function recordQuoteLookup(cacheHit: boolean): Promise<void> {
-  await ensureLoaded();
+export async function recordQuoteLookup(cacheHit: boolean, tenant?: TenantRef): Promise<void> {
+  const { stats } = await ensureLoaded(tenant);
   if (cacheHit) {
     stats.quoteCacheHits += 1;
   } else {
@@ -152,8 +175,12 @@ export async function recordQuoteLookup(cacheHit: boolean): Promise<void> {
   }
 }
 
-export async function recordLatency(kind: 'image' | 'text', durationMs: number): Promise<void> {
-  await ensureLoaded();
+export async function recordLatency(
+  kind: 'image' | 'text',
+  durationMs: number,
+  tenant?: TenantRef,
+): Promise<void> {
+  const { stats, filePath } = await ensureLoaded(tenant);
   const ms = Math.max(0, Math.round(durationMs));
   if (kind === 'image') {
     const totalPrev = stats.avgImageAnalysisMs * stats._imageCount;
@@ -173,15 +200,18 @@ export async function recordLatency(kind: 'image' | 'text', durationMs: number):
         combinedCount,
     );
   }
-  await persistStats();
+  await persistStats(filePath, stats);
 }
 
-export async function recordGeminiSuccess(usageMetadata?: {
-  promptTokenCount?: number;
-  candidatesTokenCount?: number;
-  totalTokenCount?: number;
-}): Promise<void> {
-  await ensureLoaded();
+export async function recordGeminiSuccess(
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  },
+  tenant?: TenantRef,
+): Promise<void> {
+  const { stats, filePath } = await ensureLoaded(tenant);
   const now = Date.now();
   const brt = formatTimestampBrt(now);
 
@@ -198,11 +228,11 @@ export async function recordGeminiSuccess(usageMetadata?: {
     stats.totalTokens += usageMetadata.totalTokenCount ?? 0;
   }
 
-  await persistStats();
+  await persistStats(filePath, stats);
 }
 
-export async function recordGeminiFailure(err: unknown): Promise<string> {
-  await ensureLoaded();
+export async function recordGeminiFailure(err: unknown, tenant?: TenantRef): Promise<string> {
+  const { stats, filePath } = await ensureLoaded(tenant);
   const now = Date.now();
   const brt = formatTimestampBrt(now);
   const rawMessage = err instanceof Error ? err.message : String(err);
@@ -245,12 +275,14 @@ export async function recordGeminiFailure(err: unknown): Promise<string> {
   }
 
   stats.lastError = userMessage;
-  await persistStats();
+  await persistStats(filePath, stats);
   return userMessage;
 }
 
-export async function getUsageStats(): Promise<Omit<UsageStats, '_imageCount' | '_textCount'>> {
-  await ensureLoaded();
+export async function getUsageStats(
+  tenant?: TenantRef,
+): Promise<Omit<UsageStats, '_imageCount' | '_textCount'>> {
+  const { stats } = await ensureLoaded(tenant);
   const key = process.env.GEMINI_API_KEY?.trim();
   const apiKeyConfigured = Boolean(key && key !== 'MY_GEMINI_API_KEY');
   const { _imageCount: _ic, _textCount: _tc, ...publicStats } = stats;

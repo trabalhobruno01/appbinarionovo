@@ -46,6 +46,21 @@
   status = 200
 
 [[redirects]]
+  from = "/api/session"
+  to = "/.netlify/functions/session"
+  status = 200
+
+[[redirects]]
+  from = "/api/projects/*"
+  to = "/.netlify/functions/projects?id=:splat"
+  status = 200
+
+[[redirects]]
+  from = "/api/projects"
+  to = "/.netlify/functions/projects"
+  status = 200
+
+[[redirects]]
   from = "/api/signals/*"
   to = "/.netlify/functions/signals/:splat"
   status = 200

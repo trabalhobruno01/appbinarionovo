@@ -1,3 +1,4 @@
+import { authErrorResponse, verifyFirebaseIdTokenHeader } from '../../server/firebaseAuth.ts';
 import {
   DEFAULT_PAYOUT_PERCENT,
   DEFAULT_TIE_RULE,
@@ -5,11 +6,30 @@ import {
   runCausalWalkForwardBacktest,
   settlePendingSignals,
 } from '../../server/signalValidator.ts';
+import { assertNoTenantSpoofing, TenantAccessError } from '../../server/tenantRegistry.ts';
 import { sanitizeErrorMessage } from '../../server/usageTracker.ts';
 import type { TieRule } from '../../shared/types.ts';
 
 export default async (req: Request): Promise<Response> => {
+  let authUser;
   const url = new URL(req.url);
+  try {
+    authUser = await verifyFirebaseIdTokenHeader(req.headers.get('authorization'));
+    assertNoTenantSpoofing(
+      authUser,
+      [req.headers.get('x-company-id'), url.searchParams.get('companyId')],
+      'companyId',
+    );
+    assertNoTenantSpoofing(
+      authUser,
+      [req.headers.get('x-owner-uid'), url.searchParams.get('ownerUid'), url.searchParams.get('uid')],
+      'uid',
+    );
+  } catch (err) {
+    return authErrorResponse(err);
+  }
+
+  const tenant = { uid: authUser.uid, companyId: authUser.companyId };
   const path = url.pathname;
 
   try {
@@ -17,7 +37,7 @@ export default async (req: Request): Promise<Response> => {
       const payout = Number(url.searchParams.get('payout')) || DEFAULT_PAYOUT_PERCENT;
       const tieRule: TieRule = url.searchParams.get('tieRule') === 'LOSS' ? 'LOSS' : DEFAULT_TIE_RULE;
       const settle = url.searchParams.get('settle') !== 'false';
-      const summary = await getValidationSummary(payout, tieRule, settle);
+      const summary = await getValidationSummary(payout, tieRule, settle, tenant);
       return Response.json(summary, { headers: { 'Cache-Control': 'no-store, private' } });
     }
 
@@ -25,8 +45,8 @@ export default async (req: Request): Promise<Response> => {
       const body = (await req.json().catch(() => ({}))) as { payoutPercent?: number; tieRule?: TieRule };
       const payout = Number(body.payoutPercent) || DEFAULT_PAYOUT_PERCENT;
       const tieRule: TieRule = body.tieRule === 'LOSS' ? 'LOSS' : DEFAULT_TIE_RULE;
-      const settled = await settlePendingSignals(payout, tieRule);
-      const summary = await getValidationSummary(payout, tieRule, false);
+      const settled = await settlePendingSignals(payout, tieRule, tenant);
+      const summary = await getValidationSummary(payout, tieRule, false, tenant);
       return Response.json({ ...settled, summary }, { headers: { 'Cache-Control': 'no-store, private' } });
     }
 
@@ -50,6 +70,9 @@ export default async (req: Request): Promise<Response> => {
 
     return Response.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err) {
+    if (err instanceof TenantAccessError) {
+      return authErrorResponse(err);
+    }
     const msg = err instanceof Error ? sanitizeErrorMessage(err.message) : 'Erro na validação de sinais.';
     return Response.json({ error: msg }, { status: 400, headers: { 'Cache-Control': 'no-store, private' } });
   }

@@ -1,29 +1,65 @@
-import { useState } from 'react';
-import { MessageSquarePlus, ShieldCheck, Trash2, X, Image as ImageIcon } from 'lucide-react';
-import type { Conversation } from '../../shared/types.ts';
+import { useState, type FormEvent } from 'react';
+import {
+  FolderKanban,
+  FolderPlus,
+  Image as ImageIcon,
+  LogOut,
+  MessageSquarePlus,
+  Trash2,
+  X,
+} from 'lucide-react';
+import type { Conversation, Project } from '../../shared/types.ts';
 
 interface HistorySidebarProps {
   open: boolean;
+  projects: Project[];
+  activeProjectId: string;
   conversations: Conversation[];
   activeId: string;
+  isAuthenticated: boolean;
+  onSelectProject: (projectId: string) => void;
+  onCreateProject: (name: string) => Promise<void>;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
-  onOpenAudit: () => void;
+  onOpenAudit?: () => void;
+  onLogout: () => Promise<void>;
   onClose: () => void;
 }
 
 export function HistorySidebar({
   open,
+  projects,
+  activeProjectId,
   conversations,
   activeId,
+  isAuthenticated,
+  onSelectProject,
+  onCreateProject,
   onSelect,
   onNewChat,
   onDelete,
-  onOpenAudit,
+  onLogout,
   onClose,
 }: HistorySidebarProps) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [savingProject, setSavingProject] = useState(false);
+
+  const handleCreateProjectSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    const clean = newProjectName.trim();
+    if (!clean || savingProject) return;
+    setSavingProject(true);
+    try {
+      await onCreateProject(clean);
+      setNewProjectName('');
+      setCreatingProject(false);
+    } finally {
+      setSavingProject(false);
+    }
+  };
 
   const sidebarContent = (
     <div className="flex h-full flex-col bg-white text-slate-900 dark:bg-[#0F141E] dark:text-slate-100">
@@ -52,6 +88,55 @@ export function HistorySidebar({
             <X className="h-5 w-5" />
           </button>
         </div>
+      </div>
+
+      {/* Independent User Projects Switcher */}
+      <div className="border-b border-slate-200 px-3 py-2.5 dark:border-slate-800">
+        <div className="flex items-center gap-1.5">
+          <FolderKanban className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          <select
+            aria-label="Selecionar projeto"
+            value={activeProjectId}
+            onChange={(e) => onSelectProject(e.target.value)}
+            className="h-9 min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs font-medium text-slate-800 focus:border-emerald-500 focus:outline-none dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+          >
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={() => setCreatingProject((prev) => !prev)}
+            aria-label="Criar novo projeto"
+            title="Novo projeto"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            <FolderPlus className="h-4 w-4" />
+          </button>
+        </div>
+
+        {creatingProject && (
+          <form onSubmit={handleCreateProjectSubmit} className="mt-2 flex items-center gap-1.5">
+            <input
+              type="text"
+              value={newProjectName}
+              onChange={(e) => setNewProjectName(e.target.value)}
+              placeholder="Nome do projeto..."
+              maxLength={80}
+              disabled={savingProject}
+              className="h-9 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            />
+            <button
+              type="submit"
+              disabled={savingProject || !newProjectName.trim()}
+              className="h-9 rounded-lg bg-emerald-500 px-2.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
+            >
+              Criar
+            </button>
+          </form>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
@@ -150,19 +235,21 @@ export function HistorySidebar({
         )}
       </div>
 
-      <div className="pb-safe border-t border-slate-200 p-3 dark:border-slate-800">
-        <button
-          type="button"
-          onClick={() => {
-            onClose();
-            onOpenAudit();
-          }}
-          className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-        >
-          <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-          <span>Auditoria e Validação de Sinais</span>
-        </button>
-      </div>
+      {isAuthenticated && (
+        <div className="pb-safe border-t border-slate-200 p-3 dark:border-slate-800">
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              void onLogout();
+            }}
+            className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-rose-500/25 bg-rose-500/5 px-3 text-xs font-semibold tracking-wide text-rose-600 transition-colors hover:bg-rose-500/10 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-400 dark:hover:bg-rose-500/20"
+          >
+            <LogOut className="h-4 w-4" aria-hidden="true" />
+            <span>SAIR DA CONTA</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 
