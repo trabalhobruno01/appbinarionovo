@@ -17,6 +17,7 @@ import {
   recordGeminiFailure,
   recordGeminiSuccess,
   recordLatency,
+  resolveGeminiApiKey,
   sanitizeErrorMessage,
   type TenantRef,
 } from './usageTracker.ts';
@@ -27,8 +28,8 @@ export interface AiTenantContext extends TenantRef {
 }
 
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  const apiKey = resolveGeminiApiKey();
+  if (!apiKey) {
     throw new Error('GEMINI_API_KEY não configurada no servidor.');
   }
   return new GoogleGenAI({
@@ -39,6 +40,31 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function parseGeminiJsonSafe<T>(rawText: string, fallback: T): T {
+  const trimmed = (rawText || '').trim();
+  if (!trimmed) return fallback;
+
+  const withoutFence = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  try {
+    return JSON.parse(withoutFence) as T;
+  } catch {
+    const firstBrace = withoutFence.indexOf('{');
+    const lastBrace = withoutFence.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(withoutFence.slice(firstBrace, lastBrace + 1)) as T;
+      } catch {
+        return fallback;
+      }
+    }
+    return fallback;
+  }
 }
 
 interface StageTimings {
@@ -879,7 +905,14 @@ async function runChartAnalysisUncached(params: {
       timeSync = syncRes;
       await recordGeminiSuccess(extractResp.usageMetadata, params.tenant);
 
-      const extracted = JSON.parse((extractResp.text ?? '{}').trim()) as VisualExtraction;
+      const extracted = parseGeminiJsonSafe<VisualExtraction>(extractResp.text ?? '{}', {
+        isFinancialChart: true,
+        imageReadable: true,
+        unreadableReason: null,
+        asset: null,
+        timeframe: null,
+        chartLastPrice: null,
+      });
       if (extracted.isOtc || /\bOTC\b/i.test(extracted.asset || '')) {
         isOtcChart = true;
       }
@@ -1015,7 +1048,7 @@ async function runChartAnalysisUncached(params: {
     throw new Error(safeErr);
   }
 
-  const parsed = JSON.parse(finalText) as {
+  const parsed = parseGeminiJsonSafe<{
     decision?: string;
     expectedDirection?: string;
     analysisQuality?: string;
@@ -1043,7 +1076,7 @@ async function runChartAnalysisUncached(params: {
     needsClarification?: 'ASSET' | 'TIMEFRAME' | 'NEW_PHOTO' | null;
     clarificationQuestion?: string | null;
     visibleIndicators?: string[];
-  };
+  }>(finalText, {});
 
   let rawDecision = parsed.expired
     ? 'SINAL_EXPIRADO'
@@ -1290,7 +1323,7 @@ export async function continueChartChat(params: {
   // Deduplicate and short-cache identical chat queries strictly within THIS isolated tenant+conversation
   const tailKey = params.messages
     .slice(-3)
-    .map((m) => `${m.role}:${m.text.slice(0, 80)}`)
+    .map((m) => `${m?.role || 'user'}:${typeof m?.text === 'string' ? m.text.slice(0, 80) : ''}`)
     .join('|');
   const tenantScopePrefix = `${params.tenant?.companyId || '_global'}|${params.tenant?.uid || '_anon'}|${params.tenant?.projectId || '_proj'}|${params.tenant?.conversationId || '_conv'}`;
   const chatKey = crypto
@@ -1340,10 +1373,14 @@ export async function continueChartChat(params: {
     : 'Nenhum ativo específico consultado nesta mensagem.';
 
   // Exclude duplicate trailing user message matching the active userMessage
+  const lastMsgText =
+    params.messages.length > 0 && typeof params.messages[params.messages.length - 1]?.text === 'string'
+      ? params.messages[params.messages.length - 1].text.trim()
+      : '';
   const priorMessages =
     params.messages.length > 0 &&
     params.messages[params.messages.length - 1]?.role === 'user' &&
-    params.messages[params.messages.length - 1]?.text.trim() === params.userMessage.trim()
+    lastMsgText === params.userMessage.trim()
       ? params.messages.slice(0, -1)
       : params.messages;
 
@@ -1441,7 +1478,7 @@ export async function continueChartChat(params: {
     throw new Error(safeErr);
   }
 
-  const data = JSON.parse(rawJson) as {
+  const data = parseGeminiJsonSafe<{
     replyText?: string;
     shouldAttachStructuredCard?: boolean;
     decision?: string | null;
@@ -1463,7 +1500,11 @@ export async function continueChartChat(params: {
     entryCondition?: string | null;
     cancellationCondition?: string | null;
     nextAction?: string | null;
-  };
+  }>(rawJson, {
+    replyText: rawJson && !rawJson.startsWith('{') ? rawJson : undefined,
+    shouldAttachStructuredCard: false,
+    expired: false,
+  });
 
   let analysis: ChartAnalysisResult | undefined;
   if (data.shouldAttachStructuredCard && data.decision) {

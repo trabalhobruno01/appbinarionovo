@@ -220,12 +220,13 @@ function ChartPulseWorkspace({
   useEffect(() => {
     let mounted = true;
     async function loadTenantProjects() {
-      void testFirestoreConnection();
       void ensureFirestoreTenantDocuments({
         uid: tenant.uid,
         companyId: tenant.companyId,
         email: tenant.email,
-      });
+      })
+        .then(() => testFirestoreConnection())
+        .catch(() => {});
 
       const localProjects = await loadLocalProjects(tenant.uid, tenant.companyId);
       if (!mounted) return;
@@ -246,10 +247,12 @@ function ChartPulseWorkspace({
         if (owned.length > 0) {
           setProjects(owned);
           await saveLocalProjects(tenant.uid, tenant.companyId, owned);
-          if (!owned.some((p) => p.id === activeProjectId)) {
-            setActiveProjectId(owned[0].id);
-            saveActiveProjectId(tenant.uid, tenant.companyId, owned[0].id);
+          const targetProj = owned.find((p) => p.id === activeProjectId) || owned[0];
+          if (targetProj.id !== activeProjectId) {
+            setActiveProjectId(targetProj.id);
+            saveActiveProjectId(tenant.uid, tenant.companyId, targetProj.id);
           }
+          void syncProjectToFirestore(targetProj).catch(() => {});
         }
       } catch {
         // Offline or aborted on logout
@@ -267,44 +270,52 @@ function ChartPulseWorkspace({
     async function loadHistory() {
       const local = await loadLocalConversations(tenant.uid, tenant.companyId, activeProjectId);
       if (!mounted) return;
-      setConversations(local);
-      if (local.length > 0) {
-        setActiveConvId(local[0].id);
-      } else {
-        setActiveConvId('');
-        setDraftConv(createEmptyConversation(clockOffsetRef.current, tenant, activeProjectId));
+      if (!inFlightRef.current) {
+        setConversations(local);
+        if (local.length > 0) {
+          setActiveConvId((prevId) => (prevId && local.some((c) => c.id === prevId) ? prevId : local[0].id));
+        } else {
+          setActiveConvId('');
+          setDraftConv(createEmptyConversation(clockOffsetRef.current, tenant, activeProjectId));
+        }
       }
 
       const remote = await fetchRemoteConversations(activeProjectId);
       if (!mounted || remote.length === 0) return;
 
-      const mergedMap = new Map<string, Conversation>();
-      for (const c of [...remote, ...local]) {
-        if (
-          c.ownerUid !== tenant.uid ||
-          c.companyId !== tenant.companyId ||
-          (c.projectId && c.projectId !== activeProjectId)
-        ) {
-          continue;
+      setConversations((prev) => {
+        const mergedMap = new Map<string, Conversation>();
+        for (const c of [...remote, ...local, ...prev]) {
+          if (
+            c.ownerUid !== tenant.uid ||
+            c.companyId !== tenant.companyId ||
+            (c.projectId && c.projectId !== activeProjectId)
+          ) {
+            continue;
+          }
+          const existing = mergedMap.get(c.id);
+          if (
+            !existing ||
+            c.messages.length > existing.messages.length ||
+            (c.messages.length === existing.messages.length && c.updatedAtIso > existing.updatedAtIso)
+          ) {
+            mergedMap.set(c.id, c);
+          }
         }
-        const existing = mergedMap.get(c.id);
-        if (!existing || c.updatedAtIso > existing.updatedAtIso) {
-          mergedMap.set(c.id, c);
+        const merged = Array.from(mergedMap.values()).sort((a, b) =>
+          b.updatedAtIso.localeCompare(a.updatedAtIso),
+        );
+        if (!inFlightRef.current && local.length === 0 && prev.length === 0 && merged.length > 0) {
+          setActiveConvId(merged[0].id);
         }
-      }
-      const merged = Array.from(mergedMap.values()).sort((a, b) =>
-        b.updatedAtIso.localeCompare(a.updatedAtIso),
-      );
-      setConversations(merged);
-      if (local.length === 0 && merged.length > 0) {
-        setActiveConvId(merged[0].id);
-      }
+        return merged;
+      });
     }
     void loadHistory();
     return () => {
       mounted = false;
     };
-  }, [tenant, activeProjectId]);
+  }, [tenant.uid, tenant.companyId, activeProjectId]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -374,7 +385,7 @@ function ChartPulseWorkspace({
       await saveLocalConversation(tenant.uid, tenant.companyId, stamped);
       if (syncRemote) {
         void saveRemoteConversation(stamped);
-        void syncConversationToFirestore(stamped);
+        void syncConversationToFirestore(stamped).catch(() => {});
       }
     },
     [tenant.uid, tenant.companyId, activeProjectId],
@@ -1081,15 +1092,36 @@ export default function App() {
         const info = await fetchTenantSession();
         if (!active || info.uid !== authUser?.uid) return;
         setTenantSession(info);
+        return;
       } catch {
-        if (!active || !authUser) return;
-        const safeUid = authUser.uid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-        setTenantSession({
-          uid: authUser.uid,
-          email: authUser.email,
-          companyId: `cmp_${safeUid || 'user'}`,
-        });
+        // Retry once after forcing a fresh ID token
+        try {
+          await authUser?.getIdToken(true);
+          const retried = await fetchTenantSession();
+          if (!active || retried.uid !== authUser?.uid) return;
+          setTenantSession(retried);
+          return;
+        } catch {
+          // Fallback to verified ID token claims if API is unreachable (e.g. offline mode)
+        }
       }
+
+      if (!active || !authUser) return;
+      let claimCompanyId = '';
+      try {
+        const tokenResult = await authUser.getIdTokenResult();
+        if (typeof tokenResult.claims.companyId === 'string') {
+          claimCompanyId = tokenResult.claims.companyId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+        }
+      } catch {
+        // Ignore claim read failure
+      }
+      const safeUid = authUser.uid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+      setTenantSession({
+        uid: authUser.uid,
+        email: authUser.email,
+        companyId: claimCompanyId || `cmp_${safeUid || 'user'}`,
+      });
     }
     void resolveSession();
     return () => {

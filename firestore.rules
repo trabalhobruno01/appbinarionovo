@@ -197,17 +197,21 @@ service cloud.firestore {
       allow get: if isSignedIn()
         && isValidId(userId)
         && request.auth.uid == userId
-        && existing().uid == request.auth.uid;
+        && (resource == null || existing().uid == request.auth.uid);
       allow list: if false;
       allow create: if isSignedIn()
         && isValidId(userId)
         && request.auth.uid == userId
-        && !exists(/databases/$(database)/documents/users/$(userId))
         && isValidUserProfile(incoming())
         && incoming().uid == request.auth.uid
-        && incoming().companyId == ('cmp_' + request.auth.uid)
+        && incoming().role == 'owner'
+        && (
+          incoming().companyId == ('cmp_' + request.auth.uid)
+          || (('companyId' in request.auth.token) && incoming().companyId == request.auth.token.companyId)
+        )
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/users/$(userId));
       allow update, delete: if false;
     }
 
@@ -215,9 +219,8 @@ service cloud.firestore {
     match /companies/{companyId} {
       allow get: if isSignedIn()
         && isValidId(companyId)
-        && existing().ownerUid == request.auth.uid
-        && existing().companyId == companyId
-        && isCallerCompany(companyId);
+        && isCallerCompany(companyId)
+        && (resource == null || existing().companyId == companyId);
       allow list: if isSignedIn()
         && existing().ownerUid == request.auth.uid;
       allow create: if isSignedIn()
@@ -226,8 +229,13 @@ service cloud.firestore {
         && incoming().ownerUid == request.auth.uid
         && incoming().companyId == companyId
         && incoming().createdAt == request.time
-        && ((userDocExists() && callerCompanyId() == companyId)
-          || (!userDocExists() && companyId == ('cmp_' + request.auth.uid)));
+        && (
+          (userDocExists() && callerCompanyId() == companyId)
+          || (!userDocExists() && (
+            companyId == ('cmp_' + request.auth.uid)
+            || (('companyId' in request.auth.token) && companyId == request.auth.token.companyId)
+          ))
+        );
       allow update, delete: if false;
 
       // 3. Projects strictly isolated per (companyId, ownerUid)
@@ -235,30 +243,31 @@ service cloud.firestore {
         allow get: if isSignedIn()
           && isValidId(companyId)
           && isValidId(projectId)
-          && existing().ownerUid == request.auth.uid
-          && existing().companyId == companyId
-          && isCallerCompany(companyId);
+          && isCallerCompany(companyId)
+          && (resource == null || (
+            existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+          ));
         allow list: if isSignedIn()
           && existing().ownerUid == request.auth.uid
           && existing().companyId == companyId;
         allow create: if isSignedIn()
           && isValidId(companyId)
           && isValidId(projectId)
-          && isCallerCompany(companyId)
-          && exists(/databases/$(database)/documents/companies/$(companyId))
           && isValidProject(incoming())
           && incoming().id == projectId
           && incoming().ownerUid == request.auth.uid
           && incoming().companyId == companyId
           && incoming().createdAt == request.time
-          && incoming().updatedAt == request.time;
+          && incoming().updatedAt == request.time
+          && isCallerCompany(companyId)
+          && exists(/databases/$(database)/documents/companies/$(companyId));
         allow update: if isSignedIn()
           && isValidId(companyId)
           && isValidId(projectId)
-          && isCallerCompany(companyId)
+          && isValidProject(incoming())
           && existing().ownerUid == request.auth.uid
           && existing().companyId == companyId
-          && isValidProject(incoming())
           && incoming().id == existing().id
           && incoming().ownerUid == existing().ownerUid
           && incoming().companyId == existing().companyId
@@ -270,13 +279,14 @@ service cloud.firestore {
             'defaultAsset',
             'defaultTimeframe',
             'updatedAt'
-          ]);
+          ])
+          && isCallerCompany(companyId);
         allow delete: if isSignedIn()
           && isValidId(companyId)
           && isValidId(projectId)
-          && isCallerCompany(companyId)
           && existing().ownerUid == request.auth.uid
-          && existing().companyId == companyId;
+          && existing().companyId == companyId
+          && isCallerCompany(companyId);
 
         // 4. Conversations strictly bound to (companyId, projectId, ownerUid)
         match /conversations/{conversationId} {
@@ -284,10 +294,12 @@ service cloud.firestore {
             && isValidId(companyId)
             && isValidId(projectId)
             && isValidId(conversationId)
-            && existing().ownerUid == request.auth.uid
-            && existing().companyId == companyId
-            && existing().projectId == projectId
-            && isCallerCompany(companyId);
+            && isCallerCompany(companyId)
+            && (resource == null || (
+              existing().ownerUid == request.auth.uid
+              && existing().companyId == companyId
+              && existing().projectId == projectId
+            ));
           allow list: if isSignedIn()
             && existing().ownerUid == request.auth.uid
             && existing().companyId == companyId
@@ -296,24 +308,23 @@ service cloud.firestore {
             && isValidId(companyId)
             && isValidId(projectId)
             && isValidId(conversationId)
-            && isCallerCompany(companyId)
-            && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)).data.ownerUid == request.auth.uid
             && isValidConversation(incoming())
             && incoming().id == conversationId
             && incoming().ownerUid == request.auth.uid
             && incoming().companyId == companyId
             && incoming().projectId == projectId
             && incoming().createdAt == request.time
-            && incoming().updatedAt == request.time;
+            && incoming().updatedAt == request.time
+            && isCallerCompany(companyId)
+            && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)).data.ownerUid == request.auth.uid;
           allow update: if isSignedIn()
             && isValidId(companyId)
             && isValidId(projectId)
             && isValidId(conversationId)
-            && isCallerCompany(companyId)
+            && isValidConversation(incoming())
             && existing().ownerUid == request.auth.uid
             && existing().companyId == companyId
             && existing().projectId == projectId
-            && isValidConversation(incoming())
             && incoming().id == existing().id
             && incoming().ownerUid == existing().ownerUid
             && incoming().companyId == existing().companyId
@@ -327,15 +338,16 @@ service cloud.firestore {
               'updatedAtBrt',
               'updatedAt',
               'messageCount'
-            ]);
+            ])
+            && isCallerCompany(companyId);
           allow delete: if isSignedIn()
             && isValidId(companyId)
             && isValidId(projectId)
             && isValidId(conversationId)
-            && isCallerCompany(companyId)
             && existing().ownerUid == request.auth.uid
             && existing().companyId == companyId
-            && existing().projectId == projectId;
+            && existing().projectId == projectId
+            && isCallerCompany(companyId);
 
           // 5. Messages strictly bound to parent conversation owner
           match /messages/{messageId} {
@@ -344,11 +356,13 @@ service cloud.firestore {
               && isValidId(projectId)
               && isValidId(conversationId)
               && isValidId(messageId)
-              && existing().ownerUid == request.auth.uid
-              && existing().companyId == companyId
-              && existing().projectId == projectId
-              && existing().conversationId == conversationId
-              && isCallerCompany(companyId);
+              && isCallerCompany(companyId)
+              && (resource == null || (
+                existing().ownerUid == request.auth.uid
+                && existing().companyId == companyId
+                && existing().projectId == projectId
+                && existing().conversationId == conversationId
+              ));
             allow list: if isSignedIn()
               && existing().ownerUid == request.auth.uid
               && existing().companyId == companyId
@@ -359,25 +373,25 @@ service cloud.firestore {
               && isValidId(projectId)
               && isValidId(conversationId)
               && isValidId(messageId)
-              && isCallerCompany(companyId)
-              && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)/conversations/$(conversationId)).data.ownerUid == request.auth.uid
               && isValidMessage(incoming())
               && incoming().id == messageId
               && incoming().ownerUid == request.auth.uid
               && incoming().companyId == companyId
               && incoming().projectId == projectId
               && incoming().conversationId == conversationId
-              && incoming().createdAt == request.time;
+              && incoming().createdAt == request.time
+              && isCallerCompany(companyId)
+              && get(/databases/$(database)/documents/companies/$(companyId)/projects/$(projectId)/conversations/$(conversationId)).data.ownerUid == request.auth.uid;
             allow update: if false;
             allow delete: if isSignedIn()
               && isValidId(companyId)
               && isValidId(projectId)
               && isValidId(conversationId)
               && isValidId(messageId)
-              && isCallerCompany(companyId)
               && existing().ownerUid == request.auth.uid
               && existing().companyId == companyId
-              && existing().conversationId == conversationId;
+              && existing().conversationId == conversationId
+              && isCallerCompany(companyId);
           }
         }
       }
@@ -387,21 +401,23 @@ service cloud.firestore {
         allow get: if isSignedIn()
           && isValidId(companyId)
           && isValidId(signalId)
-          && existing().ownerUid == request.auth.uid
-          && existing().companyId == companyId
-          && isCallerCompany(companyId);
+          && isCallerCompany(companyId)
+          && (resource == null || (
+            existing().ownerUid == request.auth.uid
+            && existing().companyId == companyId
+          ));
         allow list: if isSignedIn()
           && existing().ownerUid == request.auth.uid
           && existing().companyId == companyId;
         allow create: if isSignedIn()
           && isValidId(companyId)
           && isValidId(signalId)
-          && isCallerCompany(companyId)
           && isValidSignalRecord(incoming())
           && incoming().id == signalId
           && incoming().ownerUid == request.auth.uid
           && incoming().companyId == companyId
-          && incoming().createdAt == request.time;
+          && incoming().createdAt == request.time
+          && isCallerCompany(companyId);
         allow update, delete: if false;
       }
     }

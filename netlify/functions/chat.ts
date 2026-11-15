@@ -1,5 +1,6 @@
 import { continueChartChat } from '../../server/aiAnalyst.ts';
 import { authErrorResponse, verifyFirebaseIdTokenHeader } from '../../server/firebaseAuth.ts';
+import { ensureAuthorizedProjectForTenant } from '../../server/projectStore.ts';
 import {
   API_SECURITY_HEADERS,
   enforceRateLimitOrThrow,
@@ -11,6 +12,7 @@ import {
 import {
   assertNoTenantSpoofing,
   assertResourceOwnership,
+  registerResourceOwnership,
   TenantAccessError,
 } from '../../server/tenantRegistry.ts';
 import { sanitizeErrorMessage } from '../../server/usageTracker.ts';
@@ -36,7 +38,7 @@ export default async (req: Request): Promise<Response> => {
 
     authUser = await verifyFirebaseIdTokenHeader(req.headers.get('authorization'));
     enforceRateLimitOrThrow({
-      key: `nf:chat:uid:${authUser.uid}`,
+      key: `nf:chat:uid:${authUser.companyId}:${authUser.uid}`,
       maxRequests: 35,
       windowMs: 60_000,
       route: '/api/chat',
@@ -72,20 +74,19 @@ export default async (req: Request): Promise<Response> => {
     assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
     assertNoTenantSpoofing(authUser, [body.ownerUid], 'uid');
 
-    if (body.projectId) {
-      await assertResourceOwnership({
-        kind: 'projects',
-        resourceId: body.projectId,
-        authUser,
-        allowUnregistered: false,
-      });
-    }
+    const resolvedProject = await ensureAuthorizedProjectForTenant(authUser, body.projectId);
     if (body.conversationId) {
       await assertResourceOwnership({
         kind: 'conversations',
         resourceId: body.conversationId,
         authUser,
         allowUnregistered: true,
+      });
+      await registerResourceOwnership({
+        kind: 'conversations',
+        resourceId: body.conversationId,
+        authUser,
+        projectId: resolvedProject.id,
       });
     }
 
@@ -109,7 +110,7 @@ export default async (req: Request): Promise<Response> => {
         tenant: {
           uid: authUser.uid,
           companyId: authUser.companyId,
-          projectId: body.projectId,
+          projectId: resolvedProject.id,
           conversationId: body.conversationId,
         },
       }),

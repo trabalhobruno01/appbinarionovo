@@ -5,6 +5,14 @@ import { formatTimestampBrt } from './timeService.ts';
 
 export const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
+export function resolveGeminiApiKey(): string | null {
+  const raw = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
+  if (!raw) return null;
+  const unquoted = raw.replace(/^(['"])(.*)\1$/, '$2').trim();
+  if (!unquoted || unquoted === 'MY_GEMINI_API_KEY') return null;
+  return unquoted;
+}
+
 export interface TenantRef {
   uid: string;
   companyId: string;
@@ -121,8 +129,8 @@ export function sanitizeErrorMessage(raw: string): string {
     .replace(/Bearer\s+[0-9A-Za-z._-]{12,}/gi, 'Bearer [CHAVE_PROTEGIDA]')
     .replace(/([?&](?:key|apikey|api_key)=)[^&\s]+/gi, '$1[CHAVE_PROTEGIDA]');
 
-  for (const envName of ['GEMINI_API_KEY', 'TWELVE_DATA_API_KEY'] as const) {
-    const secret = process.env[envName]?.trim();
+  for (const envName of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'TWELVE_DATA_API_KEY'] as const) {
+    const secret = process.env[envName]?.trim().replace(/^(['"])(.*)\1$/, '$2').trim();
     if (secret && secret.length >= 8 && secret !== 'MY_GEMINI_API_KEY') {
       out = out.split(secret).join('[CHAVE_PROTEGIDA]');
     }
@@ -283,8 +291,7 @@ export async function getUsageStats(
   tenant?: TenantRef,
 ): Promise<Omit<UsageStats, '_imageCount' | '_textCount'>> {
   const { stats } = await ensureLoaded(tenant);
-  const key = process.env.GEMINI_API_KEY?.trim();
-  const apiKeyConfigured = Boolean(key && key !== 'MY_GEMINI_API_KEY');
+  const apiKeyConfigured = Boolean(resolveGeminiApiKey());
   const { _imageCount: _ic, _textCount: _tc, ...publicStats } = stats;
   return {
     ...publicStats,

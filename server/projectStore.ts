@@ -95,10 +95,73 @@ export async function listProjects(
   return list.sort((a, b) => a.createdAtIso.localeCompare(b.createdAtIso));
 }
 
+export async function ensureAuthorizedProjectForTenant(
+  authUser: Pick<VerifiedFirebaseUser, 'uid' | 'companyId'>,
+  projectId?: string | null,
+): Promise<Project> {
+  const defaultProj = await ensureDefaultProject(authUser);
+  if (!projectId || !projectId.trim()) {
+    return defaultProj;
+  }
+
+  const cleanId = projectId.trim();
+  if (!isValidResourceId(cleanId)) {
+    throw new TenantAccessError(403, 'Identificador de projeto inválido.');
+  }
+
+  const existingOwner = await assertResourceOwnership({
+    kind: 'projects',
+    resourceId: cleanId,
+    authUser,
+    allowUnregistered: true,
+  });
+
+  const existingList = await readProjectsRaw(authUser);
+  const found = existingList.find((p) => p.id === cleanId);
+  if (found) {
+    await registerResourceOwnership({
+      kind: 'projects',
+      resourceId: found.id,
+      authUser,
+    });
+    return found;
+  }
+
+  // Prevent cold-start spoofing of another user's deterministic default project ID (proj_<otherUid>)
+  // Only allow re-hydrating legitimate random custom project IDs (proj_<12 hex chars>) cached by this client
+  if (!existingOwner && cleanId !== defaultProj.id && !/^proj_[a-f0-9]{12}$/.test(cleanId)) {
+    throw new TenantAccessError(
+      403,
+      'Acesso negado: este recurso pertence exclusivamente a outra conta ou empresa.',
+    );
+  }
+
+  const nowIso = (await getSynchronizedBrasiliaTime(false)).isoBrt;
+  const recoveredProject: Project = {
+    id: cleanId,
+    ownerUid: authUser.uid,
+    companyId: authUser.companyId,
+    name: cleanId === defaultProj.id ? 'Projeto Principal' : 'Projeto Sincronizado',
+    defaultAsset: null,
+    defaultTimeframe: null,
+    createdAtIso: nowIso,
+    updatedAtIso: nowIso,
+  };
+
+  await registerResourceOwnership({
+    kind: 'projects',
+    resourceId: recoveredProject.id,
+    authUser,
+  });
+  await writeProjectsRaw(authUser, [...existingList, recoveredProject]);
+  return recoveredProject;
+}
+
 export async function getProjectById(
   authUser: Pick<VerifiedFirebaseUser, 'uid' | 'companyId'>,
   projectId: string,
 ): Promise<Project> {
+  await ensureDefaultProject(authUser);
   await assertResourceOwnership({
     kind: 'projects',
     resourceId: projectId,
@@ -136,6 +199,7 @@ export async function saveProject(
     throw new TenantAccessError(403, 'Identificador de projeto inválido.');
   }
 
+  await ensureDefaultProject(authUser);
   await assertResourceOwnership({
     kind: 'projects',
     resourceId: id,
@@ -178,6 +242,7 @@ export async function deleteProject(
   authUser: Pick<VerifiedFirebaseUser, 'uid' | 'companyId'>,
   projectId: string,
 ): Promise<void> {
+  await ensureDefaultProject(authUser);
   await assertResourceOwnership({
     kind: 'projects',
     resourceId: projectId,

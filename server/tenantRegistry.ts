@@ -152,30 +152,92 @@ async function syncTenantToFirestoreAdmin(
   return record;
 }
 
+async function fetchTenantFromFirestoreRest(
+  uid: string,
+  idToken: string | null | undefined,
+): Promise<{ companyId: string; email?: string; role?: 'owner' | 'member' } | null> {
+  if (!idToken || !isValidResourceId(uid)) return null;
+  const projectId =
+    process.env.FIREBASE_PROJECT_ID?.trim() ||
+    process.env.VITE_FIREBASE_PROJECT_ID?.trim() ||
+    appletConfig.projectId;
+  const dbId = appletConfig.firestoreDatabaseId || '(default)';
+  if (!projectId) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(dbId)}/documents/users/${encodeURIComponent(uid)}`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const docJson = (await res.json()) as {
+      fields?: {
+        companyId?: { stringValue?: string };
+        email?: { stringValue?: string };
+        role?: { stringValue?: string };
+      };
+    };
+    const companyId = docJson.fields?.companyId?.stringValue?.trim();
+    if (!companyId || !isValidResourceId(companyId)) return null;
+    const roleRaw = docJson.fields?.role?.stringValue;
+    return {
+      companyId,
+      email: docJson.fields?.email?.stringValue,
+      role: roleRaw === 'member' ? 'member' : 'owner',
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function resolveUserTenant(params: {
   uid: string;
   email: string | null;
   claimCompanyId?: unknown;
   adminApp?: App | null;
+  idToken?: string | null;
 }): Promise<TenantUserRecord> {
   await ensureRegistryLoaded();
 
+  const claimCompany =
+    typeof params.claimCompanyId === 'string' && isValidResourceId(params.claimCompanyId.trim())
+      ? params.claimCompanyId.trim()
+      : null;
+
   const existing = registryState.users[params.uid];
   if (existing && isValidResourceId(existing.companyId)) {
+    if (claimCompany && existing.companyId !== claimCompany) {
+      const updated: TenantUserRecord = {
+        ...existing,
+        companyId: claimCompany,
+        email: params.email || existing.email,
+      };
+      registryState.users[params.uid] = updated;
+      await persistRegistry();
+      return updated;
+    }
     return existing;
   }
 
-  const claimCompany =
-    typeof params.claimCompanyId === 'string' && isValidResourceId(params.claimCompanyId)
-      ? params.claimCompanyId
-      : null;
+  let firestoreProfile: { companyId: string; email?: string; role?: 'owner' | 'member' } | null = null;
+  if (!claimCompany && !params.adminApp && params.idToken) {
+    firestoreProfile = await fetchTenantFromFirestoreRest(params.uid, params.idToken);
+  }
 
   const nowIso = (await getSynchronizedBrasiliaTime(false)).isoBrt;
   let record: TenantUserRecord = {
     uid: params.uid,
-    companyId: claimCompany || deriveImmutableCompanyId(params.uid),
-    email: params.email,
-    role: 'owner',
+    companyId: claimCompany || firestoreProfile?.companyId || deriveImmutableCompanyId(params.uid),
+    email: params.email || firestoreProfile?.email || null,
+    role: firestoreProfile?.role || 'owner',
     provisionedAtIso: nowIso,
   };
 

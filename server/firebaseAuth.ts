@@ -167,7 +167,7 @@ async function verifyJwtWithGoogleCerts(token: string, projectId: string): Promi
   const nowSec = Math.floor(Date.now() / 1000);
   const expectedIssuer = `https://securetoken.google.com/${projectId}`;
 
-  if (typeof payload.exp !== 'number' || payload.exp <= nowSec) {
+  if (typeof payload.exp !== 'number' || payload.exp <= nowSec - 60) {
     throw new AuthVerificationError(401, 'Sessão expirada. Faça login novamente.');
   }
   if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
@@ -192,6 +192,7 @@ async function verifyJwtWithGoogleCerts(token: string, projectId: string): Promi
 async function enforceOptionalUserPolicy(
   decoded: DecodedIdToken,
   adminApp: App | null,
+  idToken?: string | null,
 ): Promise<VerifiedFirebaseUser> {
   const allowedEmailsRaw = process.env.ALLOWED_USER_EMAILS?.trim();
   const email = typeof decoded.email === 'string' ? decoded.email.toLowerCase() : null;
@@ -226,6 +227,7 @@ async function enforceOptionalUserPolicy(
     email,
     claimCompanyId: (decoded as Record<string, unknown>).companyId,
     adminApp,
+    idToken,
   });
 
   return {
@@ -258,7 +260,7 @@ export async function verifyFirebaseIdTokenHeader(
       const { getAuth } = await import('firebase-admin/auth');
       // checkRevoked=true enforces revocation and disabled user validation via Firebase Admin
       const decoded = await getAuth(adminApp).verifyIdToken(token, true);
-      return await enforceOptionalUserPolicy(decoded, adminApp);
+      return await enforceOptionalUserPolicy(decoded, adminApp, token);
     } catch (err) {
       if (err instanceof AuthVerificationError || err instanceof TenantAccessError) throw err;
       const code =
@@ -273,7 +275,7 @@ export async function verifyFirebaseIdTokenHeader(
   }
 
   const decoded = await verifyJwtWithGoogleCerts(token, projectId);
-  return await enforceOptionalUserPolicy(decoded, null);
+  return await enforceOptionalUserPolicy(decoded, null, token);
 }
 
 export function authErrorResponse(err: unknown): Response {

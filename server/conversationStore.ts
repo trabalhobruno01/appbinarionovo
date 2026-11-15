@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Conversation } from '../shared/types.ts';
 import type { VerifiedFirebaseUser } from './firebaseAuth.ts';
-import { ensureDefaultProject, getProjectById } from './projectStore.ts';
+import { ensureAuthorizedProjectForTenant, ensureDefaultProject } from './projectStore.ts';
 import {
   assertResourceOwnership,
   getTenantStorageDir,
@@ -83,9 +83,9 @@ export async function listConversations(
   projectId?: string | null,
 ): Promise<Conversation[]> {
   const defaultProject = await ensureDefaultProject(authUser);
-  if (projectId) {
-    await getProjectById(authUser, projectId);
-  }
+  const resolvedFilterProject = projectId
+    ? await ensureAuthorizedProjectForTenant(authUser, projectId)
+    : null;
 
   const raw = await readConversationsRaw(authUser);
   const normalized: Conversation[] = [];
@@ -106,8 +106,8 @@ export async function listConversations(
     normalized.push(stamped);
   }
 
-  const filtered = projectId
-    ? normalized.filter((c) => c.projectId === projectId)
+  const filtered = resolvedFilterProject
+    ? normalized.filter((c) => c.projectId === resolvedFilterProject.id)
     : normalized;
 
   return filtered.sort((a, b) => b.updatedAtIso.localeCompare(a.updatedAtIso));
@@ -117,13 +117,13 @@ export async function getConversationById(
   authUser: Pick<VerifiedFirebaseUser, 'uid' | 'companyId'>,
   convId: string,
 ): Promise<Conversation> {
+  const all = await listConversations(authUser);
   await assertResourceOwnership({
     kind: 'conversations',
     resourceId: convId,
     authUser,
     allowUnregistered: false,
   });
-  const all = await listConversations(authUser);
   const found = all.find((c) => c.id === convId);
   if (!found) {
     throw new TenantAccessError(404, 'Conversa não encontrada.');
@@ -146,9 +146,8 @@ export async function saveConversation(
     allowUnregistered: true,
   });
 
-  const defaultProject = await ensureDefaultProject(authUser);
-  const targetProjectId = conv.projectId?.trim() || defaultProject.id;
-  await getProjectById(authUser, targetProjectId);
+  const resolvedProject = await ensureAuthorizedProjectForTenant(authUser, conv.projectId);
+  const targetProjectId = resolvedProject.id;
 
   const stamped: Conversation = {
     ...conv,
@@ -175,6 +174,7 @@ export async function deleteConversation(
   authUser: Pick<VerifiedFirebaseUser, 'uid' | 'companyId'>,
   convId: string,
 ): Promise<void> {
+  const existing = await listConversations(authUser);
   await assertResourceOwnership({
     kind: 'conversations',
     resourceId: convId,
@@ -182,7 +182,6 @@ export async function deleteConversation(
     allowUnregistered: false,
   });
 
-  const existing = await listConversations(authUser);
   const filtered = existing.filter((c) => c.id !== convId);
   await writeConversationsRaw(authUser, filtered);
   await unregisterResourceOwnership('conversations', convId, authUser);

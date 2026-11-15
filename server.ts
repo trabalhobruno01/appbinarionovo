@@ -13,6 +13,7 @@ import {
 import { fetchMarketQuote } from './server/marketData.ts';
 import {
   deleteProject,
+  ensureAuthorizedProjectForTenant,
   ensureDefaultProject,
   getProjectById,
   listProjects,
@@ -37,6 +38,7 @@ import {
 import {
   assertNoTenantSpoofing,
   assertResourceOwnership,
+  registerResourceOwnership,
   TenantAccessError,
 } from './server/tenantRegistry.ts';
 import { getSynchronizedBrasiliaTime } from './server/timeService.ts';
@@ -312,23 +314,29 @@ async function startServer() {
         ownerUid?: string;
       };
 
+      enforceRateLimitOrThrow({
+        key: `analyze:uid:${authUser.companyId}:${authUser.uid}`,
+        maxRequests: 20,
+        windowMs: 60_000,
+        route: '/api/analyze',
+      });
+
       assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
       assertNoTenantSpoofing(authUser, [body.ownerUid], 'uid');
 
-      if (body.projectId) {
-        await assertResourceOwnership({
-          kind: 'projects',
-          resourceId: body.projectId,
-          authUser,
-          allowUnregistered: false,
-        });
-      }
+      const resolvedProject = await ensureAuthorizedProjectForTenant(authUser, body.projectId);
       if (body.conversationId) {
         await assertResourceOwnership({
           kind: 'conversations',
           resourceId: body.conversationId,
           authUser,
           allowUnregistered: true,
+        });
+        await registerResourceOwnership({
+          kind: 'conversations',
+          resourceId: body.conversationId,
+          authUser,
+          projectId: resolvedProject.id,
         });
       }
 
@@ -351,7 +359,7 @@ async function startServer() {
           tenant: {
             uid: authUser.uid,
             companyId: authUser.companyId,
-            projectId: body.projectId,
+            projectId: resolvedProject.id,
             conversationId: body.conversationId,
           },
         }),
@@ -360,7 +368,11 @@ async function startServer() {
 
       res.json(result);
     } catch (err) {
-      if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+      if (
+        err instanceof AuthVerificationError ||
+        err instanceof TenantAccessError ||
+        err instanceof SecurityValidationError
+      ) {
         res.status(err.status).json({ error: err.message });
         return;
       }
@@ -400,23 +412,29 @@ async function startServer() {
         ownerUid?: string;
       };
 
+      enforceRateLimitOrThrow({
+        key: `chat:uid:${authUser.companyId}:${authUser.uid}`,
+        maxRequests: 35,
+        windowMs: 60_000,
+        route: '/api/chat',
+      });
+
       assertNoTenantSpoofing(authUser, [body.companyId], 'companyId');
       assertNoTenantSpoofing(authUser, [body.ownerUid], 'uid');
 
-      if (body.projectId) {
-        await assertResourceOwnership({
-          kind: 'projects',
-          resourceId: body.projectId,
-          authUser,
-          allowUnregistered: false,
-        });
-      }
+      const resolvedProject = await ensureAuthorizedProjectForTenant(authUser, body.projectId);
       if (body.conversationId) {
         await assertResourceOwnership({
           kind: 'conversations',
           resourceId: body.conversationId,
           authUser,
           allowUnregistered: true,
+        });
+        await registerResourceOwnership({
+          kind: 'conversations',
+          resourceId: body.conversationId,
+          authUser,
+          projectId: resolvedProject.id,
         });
       }
 
@@ -438,7 +456,7 @@ async function startServer() {
           tenant: {
             uid: authUser.uid,
             companyId: authUser.companyId,
-            projectId: body.projectId,
+            projectId: resolvedProject.id,
             conversationId: body.conversationId,
           },
         }),
@@ -447,7 +465,11 @@ async function startServer() {
 
       res.json(result);
     } catch (err) {
-      if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+      if (
+        err instanceof AuthVerificationError ||
+        err instanceof TenantAccessError ||
+        err instanceof SecurityValidationError
+      ) {
         res.status(err.status).json({ error: err.message });
         return;
       }
