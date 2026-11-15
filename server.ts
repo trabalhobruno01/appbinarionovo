@@ -19,6 +19,15 @@ import {
   saveProject,
 } from './server/projectStore.ts';
 import {
+  assertSafePayload,
+  enforceRateLimitOrThrow,
+  getClientIpFromHeaders,
+  logSecurityEvent,
+  sanitizeSymbolInput,
+  SecurityValidationError,
+  verifyImageDataUrlMagicBytes,
+} from './server/securityGuard.ts';
+import {
   DEFAULT_PAYOUT_PERCENT,
   DEFAULT_TIE_RULE,
   getValidationSummary,
@@ -47,6 +56,14 @@ async function requireFirebaseAuth(
   next: express.NextFunction,
 ): Promise<void> {
   try {
+    const ip = getClientIpFromHeaders((name) => req.header(name), req.ip);
+    enforceRateLimitOrThrow({
+      key: `api:${ip}`,
+      maxRequests: 120,
+      windowMs: 60_000,
+      route: req.path,
+    });
+
     const user = await verifyFirebaseIdTokenHeader(req.header('authorization'));
     req.authUser = user;
     // Reject any cross-tenant identity spoofing in headers/query immediately
@@ -70,17 +87,31 @@ async function requireFirebaseAuth(
     next();
   } catch (err) {
     const status =
-      err instanceof AuthVerificationError || err instanceof TenantAccessError ? err.status : 401;
+      err instanceof AuthVerificationError ||
+      err instanceof TenantAccessError ||
+      err instanceof SecurityValidationError
+        ? err.status
+        : 401;
     const message =
-      err instanceof AuthVerificationError || err instanceof TenantAccessError
+      err instanceof AuthVerificationError ||
+      err instanceof TenantAccessError ||
+      err instanceof SecurityValidationError
         ? err.message
         : 'Autenticação necessária.';
+    logSecurityEvent(status === 403 ? 'EXPRESS_FORBIDDEN' : status === 429 ? 'EXPRESS_RATE_LIMIT' : 'EXPRESS_UNAUTHORIZED', {
+      path: req.path,
+      status,
+    });
     res.status(status).json({ error: message });
   }
 }
 
 function sendError(res: express.Response, err: unknown, fallbackStatus = 500, fallbackMsg = 'Erro interno.'): void {
-  if (err instanceof AuthVerificationError || err instanceof TenantAccessError) {
+  if (
+    err instanceof AuthVerificationError ||
+    err instanceof TenantAccessError ||
+    err instanceof SecurityValidationError
+  ) {
     res.status(err.status).json({ error: err.message });
     return;
   }
@@ -94,16 +125,10 @@ const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024; // ~5MB limit on payload
 // Simple in-flight dedup map scoped per authenticated user UID
 const activeRequests = new Map<string, number>();
 
-function checkImageValid(dataUrl: unknown): { ok: boolean; error?: string } {
-  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
-    return { ok: false, error: 'Formato de imagem inválido. Envie PNG, JPEG ou WebP.' };
-  }
-  const allowed = /^data:image\/(jpeg|jpg|png|webp);base64,/i;
-  if (!allowed.test(dataUrl)) {
-    return { ok: false, error: 'Tipo de arquivo não suportado. Use JPEG, PNG ou WebP.' };
-  }
-  if (Buffer.byteLength(dataUrl, 'utf-8') > MAX_IMAGE_BASE64_BYTES) {
-    return { ok: false, error: 'Imagem excede o limite de tamanho permitido após compressão.' };
+function checkImageValid(dataUrl: unknown): { ok: boolean; error?: string; status?: number } {
+  const result = verifyImageDataUrlMagicBytes(dataUrl, MAX_IMAGE_BASE64_BYTES);
+  if (result.ok === false) {
+    return { ok: false, error: result.error, status: result.status };
   }
   return { ok: true };
 }
@@ -111,10 +136,34 @@ function checkImageValid(dataUrl: unknown): { ok: boolean; error?: string } {
 async function startServer() {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '8mb' }));
-  app.use('/api', (_req, res, next) => {
-    res.setHeader('Cache-Control', 'no-store, private');
+  app.use(express.json({ limit: '6mb' }));
+  app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && 'status' in err) {
+      res.status(400).json({ error: 'JSON inválido na requisição.' });
+      return;
+    }
+    if (typeof err === 'object' && err !== null && 'type' in err && (err as { type?: string }).type === 'entity.too.large') {
+      res.status(413).json({ error: 'Payload excede o limite permitido.' });
+      return;
+    }
+    next(err);
+  });
+  app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(self)');
+    next();
+  });
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, private');
+    if (req.method === 'POST' && req.body && typeof req.body === 'object') {
+      try {
+        assertSafePayload(req.body);
+      } catch (err) {
+        sendError(res, err, 400, 'Requisição inválida.');
+        return;
+      }
+    }
     next();
   });
 
@@ -146,31 +195,40 @@ async function startServer() {
     }
   });
 
-  app.get('/api/time', async (_req, res) => {
+  app.get('/api/time', async (req, res) => {
     try {
+      const ip = getClientIpFromHeaders((name) => req.header(name), req.ip);
+      enforceRateLimitOrThrow({
+        key: `time:${ip}`,
+        maxRequests: 60,
+        windowMs: 60_000,
+        route: '/api/time',
+      });
       const sync = await getSynchronizedBrasiliaTime(true);
       res.json(sync);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Falha ao sincronizar horário de Brasília.',
-      });
+      sendError(res, err, 500, 'Falha ao sincronizar horário de Brasília.');
     }
   });
 
-  app.get('/api/quote', requireFirebaseAuth, async (req, res) => {
+  app.get('/api/quote', requireFirebaseAuth, async (req: AuthedRequest, res) => {
     try {
-      const symbol = typeof req.query.symbol === 'string' ? req.query.symbol : '';
-      const timeframe = typeof req.query.timeframe === 'string' ? req.query.timeframe : '15m';
-      if (!symbol.trim()) {
+      const symbol = sanitizeSymbolInput(req.query.symbol, 40);
+      const timeframe = sanitizeSymbolInput(req.query.timeframe || '15m', 12) || '15m';
+      if (!symbol) {
         res.status(400).json({ error: 'Parâmetro symbol é obrigatório.' });
         return;
       }
+      enforceRateLimitOrThrow({
+        key: `quote:${req.authUser!.uid}`,
+        maxRequests: 60,
+        windowMs: 60_000,
+        route: '/api/quote',
+      });
       const quote = await fetchMarketQuote(symbol, timeframe);
       res.json(quote);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Falha ao consultar cotação.',
-      });
+      sendError(res, err, 500, 'Falha ao consultar cotação.');
     }
   });
 
@@ -276,7 +334,7 @@ async function startServer() {
 
       const check = checkImageValid(body.imageDataUrl);
       if (!check.ok) {
-        res.status(400).json({ error: check.error });
+        res.status(check.status || 400).json({ error: check.error });
         return;
       }
 

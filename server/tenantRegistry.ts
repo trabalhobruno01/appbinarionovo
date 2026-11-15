@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { App } from 'firebase-admin/app';
-import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import appletConfig from '../firebase-applet-config.json' with { type: 'json' };
+import { logSecurityEvent } from './securityGuard.ts';
 import { getSynchronizedBrasiliaTime } from './timeService.ts';
 
 export interface TenantUserRecord {
@@ -111,6 +111,7 @@ async function syncTenantToFirestoreAdmin(
 ): Promise<TenantUserRecord> {
   if (!adminApp) return record;
   try {
+    const { getFirestore, FieldValue } = await import('firebase-admin/firestore');
     const db = getFirestore(adminApp, appletConfig.firestoreDatabaseId);
     const userRef = db.collection('users').doc(record.uid);
     const snap = await userRef.get();
@@ -219,6 +220,10 @@ export function assertNoTenantSpoofing(
     const candidate = raw.trim();
     const expected = fieldType === 'uid' ? authUser.uid : authUser.companyId;
     if (candidate !== expected) {
+      logSecurityEvent('BLOCKED_TENANT_SPOOFING', {
+        fieldType,
+        uidPrefix: authUser.uid.slice(0, 8),
+      });
       throw new TenantAccessError(
         403,
         'Acesso negado: tentativa de acesso cruzado ou manipulação de identidade entre contas.',
@@ -254,6 +259,10 @@ export async function assertResourceOwnership(params: {
     entry.ownerUid !== params.authUser.uid ||
     entry.companyId !== params.authUser.companyId
   ) {
+    logSecurityEvent('BLOCKED_CROSS_TENANT_RESOURCE', {
+      kind: params.kind,
+      uidPrefix: params.authUser.uid.slice(0, 8),
+    });
     throw new TenantAccessError(
       403,
       'Acesso negado: este recurso pertence exclusivamente a outra conta ou empresa.',

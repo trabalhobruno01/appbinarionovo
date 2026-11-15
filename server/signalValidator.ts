@@ -270,6 +270,10 @@ export async function settlePendingSignals(
   let settledNow = 0;
   let stillPending = 0;
 
+  const maxExternalPerPass = 8;
+  const budgetDeadlineMs = nowMs + 6500;
+  let externalLookupsDone = 0;
+
   for (const sig of ledger) {
     // Re-evaluate existing non-pending payout math when user switches broker payout/tie rule?
     // Keep original settled prices intact, only recompute netReturnUnits if already has expiryPrice!
@@ -295,6 +299,12 @@ export async function settlePendingSignals(
       stillPending += 1;
       continue;
     }
+
+    if (externalLookupsDone >= maxExternalPerPass || Date.now() >= budgetDeadlineMs) {
+      stillPending += 1;
+      continue;
+    }
+    externalLookupsDone += 1;
 
     const symbolQuery = sig.normalizedSymbol || sig.asset;
     if (sig.entryPrice === null) {

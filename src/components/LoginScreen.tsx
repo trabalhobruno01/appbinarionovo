@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Eye, EyeOff, Loader2 } from 'lucide-react';
 import { loginWithEmailAndPassword } from '../services/firebase.ts';
 
@@ -13,12 +13,39 @@ export function LoginScreen({ notice, onClearNotice }: LoginScreenProps) {
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [lockedUntilMs, setLockedUntilMs] = useState(0);
+  const [lockRemainingSec, setLockRemainingSec] = useState(0);
 
-  const displayedError = errorMessage || notice || null;
+  useEffect(() => {
+    if (!lockedUntilMs) {
+      setLockRemainingSec(0);
+      return;
+    }
+    const update = () => {
+      const rem = Math.max(0, Math.ceil((lockedUntilMs - Date.now()) / 1000));
+      setLockRemainingSec(rem);
+      if (rem === 0) {
+        setLockedUntilMs(0);
+      }
+    };
+    update();
+    const id = window.setInterval(update, 1000);
+    return () => window.clearInterval(id);
+  }, [lockedUntilMs]);
+
+  const displayedError =
+    lockRemainingSec > 0
+      ? `Muitas tentativas inválidas. Aguarde ${lockRemainingSec}s antes de tentar novamente.`
+      : errorMessage || notice || null;
 
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (isSubmitting) return;
+
+    if (lockedUntilMs > Date.now()) {
+      return;
+    }
 
     onClearNotice?.();
     setErrorMessage(null);
@@ -32,7 +59,16 @@ export function LoginScreen({ notice, onClearNotice }: LoginScreenProps) {
     setIsSubmitting(true);
     try {
       await loginWithEmailAndPassword(trimmedEmail, password);
+      setFailedAttempts(0);
+      setLockedUntilMs(0);
     } catch (err) {
+      const nextFails = failedAttempts + 1;
+      setFailedAttempts(nextFails);
+      if (nextFails >= 8) {
+        setLockedUntilMs(Date.now() + 30_000);
+      } else if (nextFails >= 5) {
+        setLockedUntilMs(Date.now() + 15_000);
+      }
       setErrorMessage(
         err instanceof Error && err.message
           ? err.message

@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
-import { cert, getApps, initializeApp, type App, type ServiceAccount } from 'firebase-admin/app';
-import { getAuth, type DecodedIdToken } from 'firebase-admin/auth';
+import type { App, ServiceAccount } from 'firebase-admin/app';
+import type { DecodedIdToken } from 'firebase-admin/auth';
 import appletConfig from '../firebase-applet-config.json' with { type: 'json' };
+import { API_SECURITY_HEADERS, logSecurityEvent } from './securityGuard.ts';
 import { resolveUserTenant, TenantAccessError } from './tenantRegistry.ts';
 
 export interface VerifiedFirebaseUser {
@@ -67,10 +68,11 @@ function resolveServiceAccount(): ServiceAccount | null {
   return null;
 }
 
-function getAdminAppIfConfigured(): App | null {
+async function getAdminAppIfConfigured(): Promise<App | null> {
   const sa = resolveServiceAccount();
   if (!sa) return null;
 
+  const { cert, getApps, initializeApp } = await import('firebase-admin/app');
   const existing = getApps().find((a) => a.name === 'chartpulse-admin');
   if (existing) return existing;
 
@@ -89,18 +91,33 @@ async function fetchGooglePublicCerts(forceRefresh = false): Promise<Record<stri
     return cachedCerts;
   }
 
-  const res = await fetch(GOOGLE_CERTS_URL);
-  if (!res.ok) {
-    throw new AuthVerificationError(401, 'Não foi possível validar a sessão. Faça login novamente.');
-  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const res = await fetch(GOOGLE_CERTS_URL, { signal: controller.signal });
+    if (!res.ok) {
+      if (Object.keys(cachedCerts).length > 0) {
+        return cachedCerts;
+      }
+      throw new AuthVerificationError(401, 'Não foi possível validar a sessão. Faça login novamente.');
+    }
 
-  const cacheControl = res.headers.get('cache-control') || '';
-  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
-  const maxAgeSec = maxAgeMatch ? Number(maxAgeMatch[1]) : 3600;
-  const certs = (await res.json()) as Record<string, string>;
-  cachedCerts = certs;
-  certsExpiresAtMs = Date.now() + Math.max(60, maxAgeSec) * 1000;
-  return certs;
+    const cacheControl = res.headers.get('cache-control') || '';
+    const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+    const maxAgeSec = maxAgeMatch ? Number(maxAgeMatch[1]) : 3600;
+    const certs = (await res.json()) as Record<string, string>;
+    cachedCerts = certs;
+    certsExpiresAtMs = Date.now() + Math.max(60, maxAgeSec) * 1000;
+    return certs;
+  } catch (err) {
+    if (err instanceof AuthVerificationError) throw err;
+    if (Object.keys(cachedCerts).length > 0) {
+      return cachedCerts;
+    }
+    throw new AuthVerificationError(401, 'Tempo esgotado ao validar sessão. Tente novamente.');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function base64UrlToBuffer(segment: string): Buffer {
@@ -234,10 +251,11 @@ export async function verifyFirebaseIdTokenHeader(
   }
 
   const projectId = resolveProjectId();
-  const adminApp = getAdminAppIfConfigured();
+  const adminApp = await getAdminAppIfConfigured();
 
   if (adminApp) {
     try {
+      const { getAuth } = await import('firebase-admin/auth');
       // checkRevoked=true enforces revocation and disabled user validation via Firebase Admin
       const decoded = await getAuth(adminApp).verifyIdToken(token, true);
       return await enforceOptionalUserPolicy(decoded, adminApp);
@@ -265,8 +283,9 @@ export function authErrorResponse(err: unknown): Response {
     err instanceof AuthVerificationError || err instanceof TenantAccessError
       ? err.message
       : 'Autenticação necessária.';
+  logSecurityEvent(status === 403 ? 'ACCESS_FORBIDDEN' : 'AUTH_REJECTED', { status });
   return Response.json(
     { error: message },
-    { status, headers: { 'Cache-Control': 'no-store, private' } },
+    { status, headers: API_SECURITY_HEADERS },
   );
 }

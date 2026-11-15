@@ -8,6 +8,7 @@
 
 [functions]
   node_bundler = "esbuild"
+  external_node_modules = ["firebase-admin"]
   included_files = ["server/**", "shared/**"]
 
 [[redirects]]
@@ -81,3 +82,14 @@
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
     Permissions-Policy = "camera=(self)"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    X-Frame-Options = "SAMEORIGIN"
+    Cross-Origin-Opener-Policy = "same-origin-allow-popups"
+    X-XSS-Protection = "0"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' https://apis.google.com https://*.firebaseapp.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' blob: mediastream:; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com https://*.firebasestorage.app wss://*.firebaseio.com; frame-ancestors 'self' https://aistudio.google.com https://*.google.com; base-uri 'self'; form-action 'self'; object-src 'none';"
+
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Cache-Control = "no-store, private"
+    X-Content-Type-Options = "nosniff"

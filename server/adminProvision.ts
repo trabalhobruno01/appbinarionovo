@@ -1,6 +1,5 @@
-import { cert, getApps, initializeApp, type ServiceAccount } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
-import { adminProvisionUserTenant } from './tenantRegistry.ts';
+import type { ServiceAccount } from 'firebase-admin/app';
+import { adminProvisionUserTenant, isValidResourceId } from './tenantRegistry.ts';
 
 function loadServiceAccountFromEnv(): ServiceAccount | null {
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
@@ -40,12 +39,27 @@ export async function provisionAuthorizedCompanyUser(params: {
   companyId: string;
   role?: 'owner' | 'member';
 }): Promise<{ uid: string; email: string; companyId: string }> {
+  if (typeof window !== 'undefined') {
+    throw new Error('Operação administrativa permitida somente no servidor.');
+  }
+
+  const cleanEmail = (params.email || '').trim().toLowerCase();
+  if (!/^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,24}$/.test(cleanEmail)) {
+    throw new Error('E-mail inválido para provisionamento administrativo.');
+  }
+  if (!isValidResourceId(params.companyId)) {
+    throw new Error('companyId inválido para provisionamento administrativo.');
+  }
+
   const sa = loadServiceAccountFromEnv();
   if (!sa) {
     throw new Error(
       'Credenciais administrativas Firebase (FIREBASE_SERVICE_ACCOUNT_JSON ou FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY) não configuradas.',
     );
   }
+
+  const { cert, getApps, initializeApp } = await import('firebase-admin/app');
+  const { getAuth } = await import('firebase-admin/auth');
 
   const app =
     getApps().find((a) => a.name === 'chartpulse-provision') ||
@@ -54,7 +68,7 @@ export async function provisionAuthorizedCompanyUser(params: {
   const auth = getAuth(app);
   let userRecord;
   try {
-    userRecord = await auth.getUserByEmail(params.email.trim());
+    userRecord = await auth.getUserByEmail(cleanEmail);
   } catch {
     if (!params.password || params.password.length < 6) {
       throw new Error('Senha com mínimo de 6 caracteres é obrigatória para criar novo usuário.');
