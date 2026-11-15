@@ -1,0 +1,6 @@
+{
+  "name": "ChartPulse AI",
+  "description": "Analista financeiro com inteligência artificial por fotografia de gráficos, cotações em tempo real e horários de Brasília.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

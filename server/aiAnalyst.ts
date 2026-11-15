@@ -1,0 +1,1140 @@
+import crypto from 'node:crypto';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import type {
+  BrasiliaTimeSync,
+  ChartAnalysisResult,
+  ChatMessage,
+  MarketQuote,
+} from '../shared/types.ts';
+import { fetchMarketQuote, normalizeAssetQuery } from './marketData.ts';
+import { recordEmittedSignal } from './signalValidator.ts';
+import { getSynchronizedBrasiliaTime } from './timeService.ts';
+import {
+  assertNotInRateLimitCooldown,
+  GEMINI_MODEL,
+  recordCacheHit,
+  recordDeduplicatedRequest,
+  recordGeminiFailure,
+  recordGeminiSuccess,
+  recordLatency,
+} from './usageTracker.ts';
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error('GEMINI_API_KEY não configurada no servidor.');
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+interface StageTimings {
+  totalMs: number;
+  timeSyncMs: number;
+  quoteMs: number;
+  geminiMs: number;
+}
+
+interface AnalysisBundle {
+  analysis: ChartAnalysisResult;
+  marketQuote: MarketQuote | null;
+  timeSync: BrasiliaTimeSync;
+  timings?: StageTimings;
+}
+
+// Cache exact image+parameter analyses for 2 minutes to save tokens/RPM
+const CACHE_TTL_MS = 120_000;
+const CHAT_CACHE_TTL_MS = 30_000;
+const analysisCache = new Map<string, { expiresAt: number; result: AnalysisBundle }>();
+const inFlightAnalyses = new Map<string, Promise<AnalysisBundle>>();
+
+type ChatBundle = {
+  replyText: string;
+  analysis?: ChartAnalysisResult;
+  marketQuote: MarketQuote | null;
+  timeSync: BrasiliaTimeSync;
+  timings?: StageTimings;
+};
+const chatCache = new Map<string, { expiresAt: number; result: ChatBundle }>();
+const inFlightChats = new Map<string, Promise<ChatBundle>>();
+
+function computeAnalysisCacheKey(
+  imageDataUrl: string,
+  userMessage?: string,
+  hintAsset?: string | null,
+  hintTimeframe?: string | null,
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(imageDataUrl)
+    .update('|')
+    .update((userMessage || '').trim().toLowerCase())
+    .update('|')
+    .update((hintAsset || '').trim().toUpperCase())
+    .update('|')
+    .update((hintTimeframe || '').trim().toLowerCase())
+    .digest('hex');
+}
+
+// Pure-TS hint extraction so we avoid a second Gemini call whenever user provides asset/timeframe
+function extractHintsFromText(
+  text?: string,
+  fallbackAsset?: string | null,
+  fallbackTimeframe?: string | null,
+): { assetHint: string | null; timeframeHint: string | null } {
+  let assetHint: string | null = null;
+  let timeframeHint: string | null = null;
+
+  if (text && text.trim()) {
+    const tfMatch = text.match(/\b(1m|3m|5m|15m|30m|1h|2h|4h|1d|1w|m1|m5|m15|m30|h1|h4|d1)\b/i);
+    if (tfMatch) {
+      timeframeHint = tfMatch[1].toLowerCase();
+    }
+
+    const rawTokens = text
+      .replace(/[,.;!?()]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 2 && t.length <= 14);
+
+    const stopWords = new Set([
+      'COMPRAR', 'COMPRA', 'VENDER', 'VENDA', 'AGUARDAR', 'ANALISAR', 'GRAFICO',
+      'GRÁFICO', 'PRECO', 'PREÇO', 'AGORA', 'HOJE', 'TESTE', 'OLHA', 'ESSE',
+      'MERCADO', 'MUDOU', 'SINAL', 'VALIDO', 'VÁLIDO', 'CANDLE', 'AINDA', 'POSSO',
+      'ENTRAR', 'SAIR', 'QUAL', 'RISCO', 'DESSA', 'SOBRE', 'HORA', 'TEMPO',
+    ]);
+
+    for (const rawToken of rawTokens) {
+      const upper = rawToken.toUpperCase();
+      if (stopWords.has(upper) || /^(1M|3M|5M|15M|30M|1H|2H|4H|1D|1W|M1|M5|M15|M30|H1|H4|D1)$/.test(upper)) {
+        continue;
+      }
+      const norm = normalizeAssetQuery(upper);
+      if (!norm) continue;
+      // Accept known asset classes directly, or explicit uppercase/numeric tickers (e.g. PETR4, NVDA, BTC/USD)
+      const hasDigitOrSymbol = /[0-9/=^.-]/.test(rawToken);
+      const isExplicitUppercase = rawToken === upper && /^[A-Z]{2,6}$/.test(rawToken);
+      if (norm.market !== 'UNKNOWN' && (norm.market !== 'US_EQUITY' || hasDigitOrSymbol || isExplicitUppercase)) {
+        assetHint = upper;
+        break;
+      }
+    }
+  }
+
+  return {
+    assetHint: assetHint || fallbackAsset || null,
+    timeframeHint: timeframeHint || fallbackTimeframe || null,
+  };
+}
+
+interface VisualExtraction {
+  isFinancialChart: boolean;
+  imageReadable: boolean;
+  unreadableReason: string | null;
+  asset: string | null;
+  timeframe: string | null;
+  chartLastPrice: number | null;
+}
+
+const VISUAL_EXTRACTION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    isFinancialChart: { type: Type.BOOLEAN },
+    imageReadable: { type: Type.BOOLEAN },
+    unreadableReason: { type: Type.STRING, nullable: true },
+    asset: { type: Type.STRING, nullable: true },
+    timeframe: { type: Type.STRING, nullable: true },
+    chartLastPrice: { type: Type.NUMBER, nullable: true },
+  },
+  required: ['isFinancialChart', 'imageReadable'],
+};
+
+const FINAL_DECISION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    decision: {
+      type: Type.STRING,
+      description: 'COMPRA (para CALL/subida), VENDA (para PUT/queda), AGUARDAR ou SINAL_EXPIRADO',
+    },
+    expectedDirection: {
+      type: Type.STRING,
+      description: 'SUBIDA (obrigatório se COMPRA), QUEDA (obrigatório se VENDA) ou INDEFINIDA (se AGUARDAR/EXPIRADO)',
+    },
+    expired: { type: Type.BOOLEAN },
+    asset: { type: Type.STRING, nullable: true },
+    timeframe: { type: Type.STRING, nullable: true },
+    entryWindowBrt: { type: Type.STRING, nullable: true, description: 'Horário futuro de entrada em HH:MM BRT' },
+    expirationDuration: { type: Type.STRING, nullable: true, description: 'Tempo de expiração compatível com o timeframe (ex: 5 min, 15 min)' },
+    exitWindowBrt: { type: Type.STRING, nullable: true, description: 'Horário de vencimento em HH:MM BRT posterior à entrada' },
+    timeRemainingToEntry: { type: Type.STRING, nullable: true },
+    signalValidity: { type: Type.STRING, nullable: true },
+    entryPrice: { type: Type.STRING, nullable: true },
+    targetPrice: { type: Type.STRING, nullable: true },
+    stopLoss: { type: Type.STRING, nullable: true },
+    technicalConfidence: { type: Type.NUMBER, nullable: true },
+    reason: { type: Type.STRING, description: 'JUSTIFICATIVA técnica objetiva de por que o gráfico favorece essa direção' },
+    riskWarning: { type: Type.STRING, nullable: true, description: 'RISCO: o que pode invalidar a previsão e fazer a operação falhar' },
+    entryCondition: { type: Type.STRING, nullable: true },
+    cancellationCondition: { type: Type.STRING, nullable: true },
+    nextAction: { type: Type.STRING, nullable: true },
+    needsClarification: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'ASSET, TIMEFRAME, NEW_PHOTO ou null',
+    },
+    clarificationQuestion: { type: Type.STRING, nullable: true },
+    visibleIndicators: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+  },
+  required: ['decision', 'expectedDirection', 'expired', 'reason', 'riskWarning', 'visibleIndicators'],
+};
+
+function parseBase64Image(dataUrlOrBase64: string, fallbackMime = 'image/jpeg'): { mimeType: string; data: string } {
+  const match = dataUrlOrBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (match) {
+    return { mimeType: match[1], data: match[2] };
+  }
+  return { mimeType: fallbackMime, data: dataUrlOrBase64 };
+}
+
+function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | null): {
+  freshnessStatus: ChartAnalysisResult['dataFreshnessStatus'];
+  freshnessNote: string;
+  contextText: string;
+} {
+  if (!quote || !quote.available) {
+    return {
+      freshnessStatus: 'SEM_COTACAO_TEMPO_REAL',
+      freshnessNote: quote?.warning || 'Cotação em tempo real indisponível para este ativo no momento.',
+      contextText: quote?.warning || 'SEM COTAÇÃO AO VIVO. Analise apenas visualmente e informe que não há confirmação de mercado em tempo real.',
+    };
+  }
+
+  let freshnessStatus: ChartAnalysisResult['dataFreshnessStatus'] = 'ATUALIZADO';
+  let diffNote = '';
+
+  if (chartLastPrice !== null && Number.isFinite(chartLastPrice) && quote.price > 0) {
+    const pctDiff = ((quote.price - chartLastPrice) / chartLastPrice) * 100;
+    if (Math.abs(pctDiff) >= 0.8) {
+      freshnessStatus = 'DEFASADO';
+      diffNote = `ATENÇÃO: Preço da foto (${chartLastPrice}) diverge em ${pctDiff >= 0 ? '+' : ''}${pctDiff.toFixed(2)}% da cotação atual (${quote.price} ${quote.currency}).`;
+    } else {
+      diffNote = `Foto (${chartLastPrice}) alinhada à cotação atual (${quote.price} ${quote.currency}).`;
+    }
+  } else {
+    diffNote = `Cotação ao vivo (${quote.provider}): ${quote.price} ${quote.currency}.`;
+  }
+
+  // Send only the 5 most recent candles to keep input tokens lean
+  const candlesSummary = quote.candles
+    .slice(-5)
+    .map((c) => `[${c.timeBrt} A:${c.open} M:${c.high} m:${c.low} F:${c.close}]`)
+    .join(' ');
+
+  const contextText = [
+    `ATIVO: ${quote.displayName} (${quote.symbol}) | PROVEDOR: ${quote.provider}`,
+    `PREÇO ATUAL: ${quote.price} ${quote.currency} (${quote.fetchedAtBrt} BRT)${quote.changePercent24h !== null ? ` | VAR: ${quote.changePercent24h}%` : ''}`,
+    diffNote,
+    candlesSummary ? `CANDLES (${quote.timeframe}): ${candlesSummary}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  return {
+    freshnessStatus,
+    freshnessNote: diffNote + (quote.warning ? ` ${quote.warning}` : ''),
+    contextText,
+  };
+}
+
+function parseMinutesOfDay(text?: string | null): number | null {
+  if (!text) return null;
+  const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function normalizeDecisionValue(raw?: string | null): ChartAnalysisResult['decision'] {
+  const up = (raw || '').toUpperCase().trim();
+  if (up === 'COMPRA' || up === 'CALL' || up.includes('COMPRA')) return 'COMPRA';
+  if (up === 'VENDA' || up === 'PUT' || up.includes('VENDA')) return 'VENDA';
+  if (up === 'SINAL_EXPIRADO' || up.includes('EXPIRAD')) return 'SINAL_EXPIRADO';
+  return 'AGUARDAR';
+}
+
+function normalizeExpectedDirection(
+  raw?: string | null,
+): 'SUBIDA' | 'QUEDA' | 'INDEFINIDA' {
+  const up = (raw || '').toUpperCase().trim();
+  if (up === 'SUBIDA' || up.includes('SUBID') || up.includes('ALTA')) return 'SUBIDA';
+  if (up === 'QUEDA' || up.includes('QUED') || up.includes('BAIXA')) return 'QUEDA';
+  return 'INDEFINIDA';
+}
+
+function validateSignalConsistency(params: {
+  decision: ChartAnalysisResult['decision'];
+  expectedDirection: 'SUBIDA' | 'QUEDA' | 'INDEFINIDA';
+  entryWindowBrt: string | null;
+  exitWindowBrt: string | null;
+  expirationDuration: string | null;
+  nowTimeBrt: string;
+  asset: string | null;
+  reason: string;
+  riskWarning: string | null;
+}): {
+  decision: ChartAnalysisResult['decision'];
+  expectedDirection: 'SUBIDA' | 'QUEDA' | 'INDEFINIDA';
+  entryWindowBrt: string | null;
+  exitWindowBrt: string | null;
+  expirationDuration: string | null;
+  reason: string;
+  nextAction: string | null;
+} {
+  let { decision, expectedDirection, entryWindowBrt, exitWindowBrt, expirationDuration, reason } = params;
+
+  if (decision === 'SINAL_EXPIRADO' || decision === 'AGUARDAR') {
+    return {
+      decision,
+      expectedDirection: decision === 'AGUARDAR' && expectedDirection !== 'INDEFINIDA' ? expectedDirection : 'INDEFINIDA',
+      entryWindowBrt: null,
+      exitWindowBrt: null,
+      expirationDuration: null,
+      reason,
+      nextAction: null,
+    };
+  }
+
+  // 1. Strict directional lock: COMPRA (CALL) = SUBIDA, VENDA (PUT) = QUEDA
+  if (decision === 'COMPRA' && expectedDirection === 'QUEDA') {
+    return {
+      decision: 'AGUARDAR',
+      expectedDirection: 'INDEFINIDA',
+      entryWindowBrt: null,
+      exitWindowBrt: null,
+      expirationDuration: null,
+      reason: `Sinal bloqueado por inconsistência direcional (COMPRA exige previsão de SUBIDA, mas o cenário apontou queda). ${reason}`,
+      nextAction: 'Não operar até haver alinhamento claro entre tendência, candles e direção.',
+    };
+  }
+  if (decision === 'VENDA' && expectedDirection === 'SUBIDA') {
+    return {
+      decision: 'AGUARDAR',
+      expectedDirection: 'INDEFINIDA',
+      entryWindowBrt: null,
+      exitWindowBrt: null,
+      expirationDuration: null,
+      reason: `Sinal bloqueado por inconsistência direcional (VENDA exige previsão de QUEDA, mas o cenário apontou subida). ${reason}`,
+      nextAction: 'Não operar até haver alinhamento claro entre tendência, candles e direção.',
+    };
+  }
+
+  expectedDirection = decision === 'COMPRA' ? 'SUBIDA' : 'QUEDA';
+
+  // 2. Ensure entry time is not in the past relative to synchronized Brasília clock
+  const nowMin = parseMinutesOfDay(params.nowTimeBrt);
+  const entryMin = parseMinutesOfDay(entryWindowBrt);
+  const exitMin = parseMinutesOfDay(exitWindowBrt);
+
+  if (nowMin !== null && entryMin !== null) {
+    let deltaEntry = entryMin - nowMin;
+    if (deltaEntry < -720) deltaEntry += 1440; // midnight rollover guard
+    if (deltaEntry > 720) deltaEntry -= 1440;
+    if (deltaEntry < -1) {
+      return {
+        decision: 'AGUARDAR',
+        expectedDirection: 'INDEFINIDA',
+        entryWindowBrt: null,
+        exitWindowBrt: null,
+        expirationDuration: null,
+        reason: `Sinal retido para proteção de capital: o horário de entrada (${entryWindowBrt}) já está no passado em relação ao horário atual de Brasília (${params.nowTimeBrt}).`,
+        nextAction: 'Aguardar o próximo candle ou enviar nova fotografia atualizada.',
+      };
+    }
+  }
+
+  // 3. Ensure expiration / exit window is strictly after entry window when both are HH:MM
+  if (entryMin !== null && exitMin !== null) {
+    let deltaExit = exitMin - entryMin;
+    if (deltaExit <= -720) deltaExit += 1440;
+    if (deltaExit <= 0) {
+      return {
+        decision: 'AGUARDAR',
+        expectedDirection: 'INDEFINIDA',
+        entryWindowBrt: null,
+        exitWindowBrt: null,
+        expirationDuration: null,
+        reason: `Sinal retido por inconsistência no vencimento (${exitWindowBrt} não é posterior à entrada ${entryWindowBrt}).`,
+        nextAction: 'Aguardar nova formação com janela de expiração coerente.',
+      };
+    }
+  }
+
+  // 4. Require identifiable asset for active directional trade signals
+  if (!params.asset) {
+    return {
+      decision: 'AGUARDAR',
+      expectedDirection: 'INDEFINIDA',
+      entryWindowBrt: null,
+      exitWindowBrt: null,
+      expirationDuration: null,
+      reason: `Ativo não identificado com segurança para emitir sinal direcional. ${reason}`,
+      nextAction: 'Informe o ativo ou envie foto enquadrando o código do ativo.',
+    };
+  }
+
+  return {
+    decision,
+    expectedDirection,
+    entryWindowBrt,
+    exitWindowBrt,
+    expirationDuration,
+    reason,
+    nextAction: null,
+  };
+}
+
+function buildFormattedReport(
+  raw: Omit<ChartAnalysisResult, 'formattedReport'>,
+): string {
+  if (raw.expired || raw.decision === 'SINAL_EXPIRADO') {
+    return [
+      'SINAL EXPIRADO — NÃO ENTRAR NESTA CONDIÇÃO. AGUARDAR NOVA OPORTUNIDADE.',
+      '',
+      `ATIVO: ${raw.asset || 'Não identificado'}`,
+      `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
+      `HORÁRIO DA ANÁLISE: ${raw.analysisTimeBrt} — Brasília`,
+      `JUSTIFICATIVA: ${raw.reason}`,
+      `RISCO: ${raw.riskWarning || 'Entrada tardia reduz a assimetria da operação e aumenta risco de perda.'}`,
+      raw.nextAction ? `PRÓXIMA AÇÃO: ${raw.nextAction}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (raw.decision === 'AGUARDAR') {
+    return [
+      'DECISÃO: AGUARDAR.',
+      'DIREÇÃO ESPERADA: INDEFINIDA (AGUARDAR CONFIRMAÇÃO)',
+      raw.asset ? `ATIVO: ${raw.asset}` : null,
+      `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
+      `HORÁRIO DA ANÁLISE: ${raw.analysisTimeBrt} — Brasília`,
+      '',
+      `JUSTIFICATIVA:\n${raw.reason}`,
+      '',
+      `RISCO:\n${raw.riskWarning || 'Operar sem confirmação clara ou contra suporte/resistência próximo eleva o risco de perda.'}`,
+      raw.nextAction ? `\nPRÓXIMA AÇÃO: ${raw.nextAction}` : null,
+      raw.clarificationQuestion ? `PERGUNTA: ${raw.clarificationQuestion}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  const decisionLabel = raw.decision === 'COMPRA' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
+  const dirLabel = raw.expectedDirection === 'SUBIDA' || raw.decision === 'COMPRA' ? 'SUBIDA' : 'QUEDA';
+
+  return [
+    `DECISÃO: ${decisionLabel}.`,
+    `DIREÇÃO ESPERADA: ${dirLabel}.`,
+    '',
+    `ATIVO: ${raw.asset || 'Não identificado'}`,
+    `HORÁRIO DE ENTRADA: ${raw.entryWindowBrt || 'Aguardar próximo candle (Brasília)'}`,
+    `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
+    `EXPIRAÇÃO: ${raw.expirationDuration || 'Compatível com 1 a 2 candles do timeframe'}`,
+    `HORÁRIO DE VENCIMENTO: ${raw.exitWindowBrt || 'Fechamento da expiração (Brasília)'}`,
+    raw.entryPrice ? `REGIÃO DE ENTRADA: ${raw.entryPrice}` : null,
+    raw.stopLoss ? `INVALIDAÇÃO / STOP: ${raw.stopLoss}` : null,
+    raw.targetPrice ? `ALVO TÉCNICO: ${raw.targetPrice}` : null,
+    `CONFIANÇA TÉCNICA: ${raw.technicalConfidence ?? 50}/100`,
+    '',
+    `JUSTIFICATIVA:\n${raw.reason}`,
+    '',
+    `RISCO:\n${raw.riskWarning || raw.cancellationCondition || 'Reversão brusca ou rejeição em nível próximo de suporte/resistência pode invalidar a previsão.'}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function runChartAnalysisUncached(params: {
+  imageDataUrl: string;
+  userMessage?: string;
+  photoReceivedAtBrt?: string;
+  history?: ChatMessage[];
+}): Promise<AnalysisBundle> {
+  const tStart = Date.now();
+  await assertNotInRateLimitCooldown();
+  const ai = getGeminiClient();
+  const { mimeType, data } = parseBase64Image(params.imageDataUrl);
+  const imagePart = { inlineData: { mimeType, data } };
+
+  // Extract hints from caption or previous conversation asset to skip Pass 1 when possible
+  const lastConvAsset = [...(params.history || [])]
+    .reverse()
+    .find((m) => m.analysis?.asset)?.analysis?.asset;
+  const lastConvTf = [...(params.history || [])]
+    .reverse()
+    .find((m) => m.analysis?.timeframe)?.analysis?.timeframe;
+  const hints = extractHintsFromText(params.userMessage, lastConvAsset, lastConvTf);
+
+  let detectedAsset: string | null = hints.assetHint;
+  let detectedTimeframe: string | null = hints.timeframeHint;
+  let chartLastPrice: number | null = null;
+
+  let timeSyncMs = 0;
+  let quoteMs = 0;
+  let geminiMs = 0;
+  let timeSync: BrasiliaTimeSync;
+  let marketQuote: MarketQuote | null = null;
+
+  if (detectedAsset) {
+    // Asset already known from caption/context: run time sync + live quote in parallel!
+    const tSyncStart = Date.now();
+    const tQuoteStart = Date.now();
+    const [syncRes, quoteRes] = await Promise.all([
+      getSynchronizedBrasiliaTime(false).then((r) => {
+        timeSyncMs = Date.now() - tSyncStart;
+        return r;
+      }),
+      fetchMarketQuote(detectedAsset, detectedTimeframe).then((r) => {
+        quoteMs = Date.now() - tQuoteStart;
+        return r;
+      }),
+    ]);
+    timeSync = syncRes;
+    marketQuote = quoteRes;
+  } else {
+    // Asset unknown: run timeSync in parallel with lightweight Pass 1 visual extraction
+    const tSyncStart = Date.now();
+    const tPass1Start = Date.now();
+    try {
+      const [syncRes, extractResp] = await Promise.all([
+        getSynchronizedBrasiliaTime(false).then((r) => {
+          timeSyncMs = Date.now() - tSyncStart;
+          return r;
+        }),
+        ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: {
+            parts: [
+              imagePart,
+              {
+                text: 'Identifique apenas se é um gráfico financeiro legível, o código do ativo, o timeframe e o último preço visível. Não invente dados ilegíveis. Se não for legível, escreva unreadableReason em português (PT-BR).',
+              },
+            ],
+          },
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            responseMimeType: 'application/json',
+            responseSchema: VISUAL_EXTRACTION_SCHEMA,
+          },
+        }),
+      ]);
+      geminiMs += Date.now() - tPass1Start;
+      timeSync = syncRes;
+      await recordGeminiSuccess(extractResp.usageMetadata);
+
+      const extracted = JSON.parse((extractResp.text ?? '{}').trim()) as VisualExtraction;
+      if (!extracted.isFinancialChart || !extracted.imageReadable) {
+        const photoReceivedBrt = params.photoReceivedAtBrt || `${timeSync.dateBrt} ${timeSync.timeBrt}`;
+        const reason =
+          extracted.unreadableReason ||
+          'A imagem está cortada, desfocada ou não mostra um gráfico financeiro legível com candles e escala de preço identificáveis.';
+        const base: Omit<ChartAnalysisResult, 'formattedReport'> = {
+          decision: 'AGUARDAR',
+          expired: false,
+          asset: extracted.asset || null,
+          normalizedSymbol: null,
+          timeframe: extracted.timeframe || null,
+          analysisTimeBrt: `${timeSync.dateBrt} ${timeSync.timeBrt}`,
+          photoReceivedAtBrt: photoReceivedBrt,
+          entryWindowBrt: null,
+          exitWindowBrt: null,
+          timeRemainingToEntry: null,
+          signalValidity: null,
+          entryPrice: null,
+          targetPrice: null,
+          stopLoss: null,
+          technicalConfidence: null,
+          reason,
+          entryCondition: null,
+          cancellationCondition: null,
+          nextAction: 'Envie outra fotografia nítida enquadrando os candles, ativo e escala de preços.',
+          dataFreshnessStatus: 'SEM_COTACAO_TEMPO_REAL',
+          dataFreshnessNote: 'Análise visual interrompida por baixa legibilidade.',
+          needsClarification: 'NEW_PHOTO',
+          clarificationQuestion: 'Poderia enviar outra fotografia mais nítida e sem cortes do gráfico?',
+          visibleIndicators: [],
+        };
+        const totalMs = Date.now() - tStart;
+        await recordLatency('image', totalMs);
+        return {
+          analysis: { ...base, formattedReport: buildFormattedReport(base) },
+          marketQuote: null,
+          timeSync,
+          timings: { totalMs, timeSyncMs, quoteMs, geminiMs },
+        };
+      }
+
+      detectedAsset = extracted.asset || null;
+      detectedTimeframe = extracted.timeframe || detectedTimeframe;
+      chartLastPrice = typeof extracted.chartLastPrice === 'number' ? extracted.chartLastPrice : null;
+    } catch (err) {
+      const safeErr = await recordGeminiFailure(err);
+      throw new Error(safeErr);
+    }
+
+    if (detectedAsset) {
+      const tQuoteStart = Date.now();
+      marketQuote = await fetchMarketQuote(detectedAsset, detectedTimeframe);
+      quoteMs = Date.now() - tQuoteStart;
+    }
+  }
+
+  const photoReceivedBrt = params.photoReceivedAtBrt || `${timeSync.dateBrt} ${timeSync.timeBrt}`;
+  const analysisNow = await getSynchronizedBrasiliaTime(false);
+  const quoteCtx = formatQuoteContext(marketQuote, chartLastPrice);
+
+  // Strict Binary Options Direction & Capital Protection Instruction
+  const systemInstruction = [
+    'Analista técnico financeiro conservador focado em proteção de capital (PT-BR).',
+    'LÓGICA OBRIGATÓRIA DE OPÇÕES BINÁRIAS (NUNCA INVERTER): COMPRA (CALL) = previsão de SUBIDA (preço fecha ACIMA da entrada no vencimento). VENDA (PUT) = previsão de QUEDA (preço fecha ABAIXO da entrada no vencimento).',
+    'ANTES DE DECIDIR, AVALIE INTERNAMENTE OS 7 CRITÉRIOS: (1) maior evidência de subir ou cair na expiração; (2) tendência predominante; (3) confirmação dos candles/pavios; (4) suportes/resistências que podem travar o movimento; (5) momento adequado de entrada; (6) movimento compatível com o tempo de expiração; (7) evidências contrárias.',
+    'NUNCA recomende COMPRA só porque o último candle é verde, nem VENDA só porque o último candle é vermelho. Prefira perder oportunidade (AGUARDAR) a emitir sinal sem confirmação.',
+    'PROIBIDO: recomendar martingale, dobrar mão, aumentar frequência para recuperar perdas, prometer lucro/assertividade ou inventar preços/indicadores não visíveis.',
+  ].join(' ');
+
+  const decisionPrompt = [
+    `BRASÍLIA: foto ${photoReceivedBrt} | agora ${analysisNow.dateBrt} ${analysisNow.timeBrt} (${analysisNow.shortTimeBrt} BRT)`,
+    detectedAsset ? `ATIVO: ${detectedAsset}` : 'ATIVO: detectar na foto; se ilegível, pedir esclarecimento (needsClarification="ASSET") e responder AGUARDAR.',
+    detectedTimeframe ? `TIMEFRAME: ${detectedTimeframe}` : 'TIMEFRAME: detectar na foto; se não visível e impedir estimativa de horário/expiração, pedir (needsClarification="TIMEFRAME") e responder AGUARDAR.',
+    params.userMessage ? `USUÁRIO: "${params.userMessage}"` : null,
+    `MERCADO AO VIVO:\n${quoteCtx.contextText}`,
+    'REGRAS DE SAÍDA: Para COMPRA use expectedDirection="SUBIDA". Para VENDA use expectedDirection="QUEDA". Se lateralizado, contra S/R imediato, foto cortada/desfocada ou sem confirmação clara, responda decision="AGUARDAR" e expectedDirection="INDEFINIDA". Horário de entrada (entryWindowBrt) DEVE ser futuro (>= agora em Brasília) e horário de vencimento (exitWindowBrt) posterior à entrada, com expirationDuration explícita (ex: "5 min", "15 min"). Preencha reason (JUSTIFICATIVA) e riskWarning (RISCO: o que pode fazer a previsão falhar). Se foto defasada e movimento já passou, marque SINAL_EXPIRADO.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  let finalText = '{}';
+  try {
+    await assertNotInRateLimitCooldown();
+    const tGemStart = Date.now();
+    const finalResp = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: { parts: [imagePart, { text: decisionPrompt }] },
+      config: {
+        systemInstruction,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+        responseMimeType: 'application/json',
+        responseSchema: FINAL_DECISION_SCHEMA,
+      },
+    });
+    geminiMs += Date.now() - tGemStart;
+    await recordGeminiSuccess(finalResp.usageMetadata);
+    finalText = (finalResp.text ?? '{}').trim();
+  } catch (err) {
+    const safeErr = await recordGeminiFailure(err);
+    throw new Error(safeErr);
+  }
+
+  const parsed = JSON.parse(finalText) as {
+    decision?: string;
+    expectedDirection?: string;
+    expired?: boolean;
+    asset?: string | null;
+    timeframe?: string | null;
+    entryWindowBrt?: string | null;
+    expirationDuration?: string | null;
+    exitWindowBrt?: string | null;
+    timeRemainingToEntry?: string | null;
+    signalValidity?: string | null;
+    entryPrice?: string | null;
+    targetPrice?: string | null;
+    stopLoss?: string | null;
+    technicalConfidence?: number | null;
+    reason?: string;
+    riskWarning?: string | null;
+    entryCondition?: string | null;
+    cancellationCondition?: string | null;
+    nextAction?: string | null;
+    needsClarification?: 'ASSET' | 'TIMEFRAME' | 'NEW_PHOTO' | null;
+    clarificationQuestion?: string | null;
+    visibleIndicators?: string[];
+  };
+
+  const rawDecision = parsed.expired
+    ? 'SINAL_EXPIRADO'
+    : normalizeDecisionValue(parsed.decision);
+  const rawDirection = normalizeExpectedDirection(parsed.expectedDirection);
+  const finalAsset = parsed.asset ?? detectedAsset ?? null;
+  const finalTimeframe = parsed.timeframe ?? detectedTimeframe ?? null;
+
+  const validated = validateSignalConsistency({
+    decision: rawDecision,
+    expectedDirection: rawDirection,
+    entryWindowBrt: parsed.entryWindowBrt ?? null,
+    exitWindowBrt: parsed.exitWindowBrt ?? null,
+    expirationDuration: parsed.expirationDuration ?? null,
+    nowTimeBrt: analysisNow.shortTimeBrt,
+    asset: finalAsset,
+    reason: parsed.reason || 'Análise técnica concluída com base nos candles visíveis.',
+    riskWarning: parsed.riskWarning ?? parsed.cancellationCondition ?? null,
+  });
+
+  const baseResult: Omit<ChartAnalysisResult, 'formattedReport'> = {
+    decision: validated.decision,
+    expectedDirection: validated.expectedDirection,
+    expired: Boolean(parsed.expired || validated.decision === 'SINAL_EXPIRADO'),
+    asset: finalAsset,
+    normalizedSymbol: marketQuote?.available ? marketQuote.symbol : null,
+    timeframe: finalTimeframe,
+    analysisTimeBrt: `${analysisNow.dateBrt} ${analysisNow.timeBrt}`,
+    photoReceivedAtBrt: photoReceivedBrt,
+    entryWindowBrt: validated.entryWindowBrt,
+    expirationDuration: validated.expirationDuration,
+    exitWindowBrt: validated.exitWindowBrt,
+    timeRemainingToEntry:
+      validated.decision === 'COMPRA' || validated.decision === 'VENDA'
+        ? (parsed.timeRemainingToEntry ?? null)
+        : null,
+    signalValidity:
+      validated.decision === 'COMPRA' || validated.decision === 'VENDA'
+        ? (parsed.signalValidity ?? validated.expirationDuration ?? null)
+        : null,
+    entryPrice: parsed.entryPrice ?? null,
+    targetPrice: parsed.targetPrice ?? null,
+    stopLoss: parsed.stopLoss ?? null,
+    technicalConfidence:
+      typeof parsed.technicalConfidence === 'number'
+        ? Math.max(0, Math.min(100, Math.round(parsed.technicalConfidence)))
+        : null,
+    reason: validated.reason,
+    riskWarning: parsed.riskWarning ?? parsed.cancellationCondition ?? null,
+    entryCondition: parsed.entryCondition ?? null,
+    cancellationCondition: parsed.cancellationCondition ?? parsed.riskWarning ?? null,
+    nextAction: validated.nextAction ?? parsed.nextAction ?? null,
+    dataFreshnessStatus: quoteCtx.freshnessStatus,
+    dataFreshnessNote: quoteCtx.freshnessNote,
+    needsClarification: parsed.needsClarification ?? null,
+    clarificationQuestion: parsed.clarificationQuestion ?? null,
+    visibleIndicators: parsed.visibleIndicators || [],
+  };
+
+  const finalAnalysis: ChartAnalysisResult = {
+    ...baseResult,
+    formattedReport: buildFormattedReport(baseResult),
+  };
+
+  if (!finalAnalysis.expired && (finalAnalysis.decision === 'COMPRA' || finalAnalysis.decision === 'VENDA')) {
+    await recordEmittedSignal({
+      analysis: finalAnalysis,
+      marketQuote,
+      origin: 'LIVE_AI',
+    }).catch(() => {});
+  }
+
+  const totalMs = Date.now() - tStart;
+  await recordLatency('image', totalMs);
+
+  return {
+    analysis: finalAnalysis,
+    marketQuote,
+    timeSync: analysisNow,
+    timings: { totalMs, timeSyncMs, quoteMs, geminiMs },
+  };
+}
+
+export async function analyzeChartImage(params: {
+  imageDataUrl: string;
+  userMessage?: string;
+  photoReceivedAtBrt?: string;
+  history?: ChatMessage[];
+}): Promise<AnalysisBundle> {
+  const lastConvAsset = [...(params.history || [])]
+    .reverse()
+    .find((m) => m.analysis?.asset)?.analysis?.asset;
+  const lastConvTf = [...(params.history || [])]
+    .reverse()
+    .find((m) => m.analysis?.timeframe)?.analysis?.timeframe;
+
+  const cacheKey = computeAnalysisCacheKey(
+    params.imageDataUrl,
+    params.userMessage,
+    lastConvAsset,
+    lastConvTf,
+  );
+
+  // 1. Return exact cached result if still valid
+  const cached = analysisCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    await recordCacheHit();
+    return cached.result;
+  }
+
+  // 2. Deduplicate concurrent identical requests
+  const existingPromise = inFlightAnalyses.get(cacheKey);
+  if (existingPromise) {
+    await recordDeduplicatedRequest();
+    return existingPromise;
+  }
+
+  const runPromise = runChartAnalysisUncached(params)
+    .then((bundle) => {
+      analysisCache.set(cacheKey, { expiresAt: Date.now() + CACHE_TTL_MS, result: bundle });
+      if (analysisCache.size > 30) {
+        const firstKey = analysisCache.keys().next().value;
+        if (firstKey) analysisCache.delete(firstKey);
+      }
+      return bundle;
+    })
+    .finally(() => {
+      inFlightAnalyses.delete(cacheKey);
+    });
+
+  inFlightAnalyses.set(cacheKey, runPromise);
+  return runPromise;
+}
+
+function isPureTimeQuery(text: string): boolean {
+  return /^(qual\s+(é\s+o\s+|o\s+)?hor[áa]rio(\s+atual)?(\s+de\s+bras[íi]lia)?|que\s+horas?\s+(s[ãa]o|é)(\s+agora)?(\s+em\s+bras[íi]lia)?|hora\s+atual(\s+em\s+bras[íi]lia)?)\??$/i.test(
+    text.trim(),
+  );
+}
+
+function isPureQuoteQuery(text: string): boolean {
+  return /^(qual\s+(a|é\s+a)?\s*)?(cota[çc][ãa]o|pre[çc]o|valor|quanto\s+(t[áa]|est[áa]|custa))\s+((atual\s+)?(do|da|de)\s+)?[a-z0-9./^-]{2,14}(\s+(hoje|agora))?\??$/i.test(
+    text.trim(),
+  );
+}
+
+export async function continueChartChat(params: {
+  messages: ChatMessage[];
+  userMessage: string;
+  lastAsset?: string | null;
+  lastTimeframe?: string | null;
+}): Promise<ChatBundle> {
+  const tStart = Date.now();
+  const trimmedMsg = params.userMessage.trim();
+
+  // Pure TypeScript fast path 1: Brasília time query (zero Gemini tokens)
+  if (isPureTimeQuery(trimmedMsg)) {
+    const tSync = Date.now();
+    const timeSync = await getSynchronizedBrasiliaTime(true);
+    const timeSyncMs = Date.now() - tSync;
+    const totalMs = Date.now() - tStart;
+    await recordLatency('text', totalMs);
+    return {
+      replyText: `Horário oficial de Brasília agora: ${timeSync.dateBrt} às ${timeSync.timeBrt} BRT (America/Sao_Paulo).`,
+      marketQuote: null,
+      timeSync,
+      timings: { totalMs, timeSyncMs, quoteMs: 0, geminiMs: 0 },
+    };
+  }
+
+  const lastImageMsg = [...params.messages].reverse().find((m) => Boolean(m.imageDataUrl));
+  const lastAnalysisMsg = [...params.messages].reverse().find((m) => Boolean(m.analysis));
+  const prevAnalysis = lastAnalysisMsg?.analysis;
+
+  const hints = extractHintsFromText(
+    trimmedMsg,
+    params.lastAsset || prevAnalysis?.asset,
+    params.lastTimeframe || prevAnalysis?.timeframe,
+  );
+  const targetAsset = hints.assetHint;
+  const targetTimeframe = hints.timeframeHint;
+
+  // Pure TypeScript fast path 2: Pure quote lookup without AI analysis request (zero Gemini tokens)
+  if (targetAsset && isPureQuoteQuery(trimmedMsg)) {
+    const tSyncStart = Date.now();
+    const tQuoteStart = Date.now();
+    let timeSyncMs = 0;
+    let quoteMs = 0;
+    const [timeSync, liveQuote] = await Promise.all([
+      getSynchronizedBrasiliaTime(false).then((r) => {
+        timeSyncMs = Date.now() - tSyncStart;
+        return r;
+      }),
+      fetchMarketQuote(targetAsset, targetTimeframe).then((r) => {
+        quoteMs = Date.now() - tQuoteStart;
+        return r;
+      }),
+    ]);
+
+    if (liveQuote.available) {
+      const varTxt =
+        liveQuote.changePercent24h !== null
+          ? ` (${liveQuote.changePercent24h >= 0 ? '+' : ''}${liveQuote.changePercent24h.toFixed(2)}%)`
+          : '';
+      const totalMs = Date.now() - tStart;
+      await recordLatency('text', totalMs);
+      return {
+        replyText: `${liveQuote.displayName}: ${liveQuote.price.toLocaleString('pt-BR', { maximumFractionDigits: 6 })} ${liveQuote.currency}${varTxt} — fonte ${liveQuote.provider} às ${liveQuote.fetchedAtBrt} BRT.`,
+        marketQuote: liveQuote,
+        timeSync,
+        timings: { totalMs, timeSyncMs, quoteMs, geminiMs: 0 },
+      };
+    }
+  }
+
+  // Deduplicate and short-cache identical chat queries to avoid duplicate Gemini API usage
+  const tailKey = params.messages
+    .slice(-3)
+    .map((m) => `${m.role}:${m.text.slice(0, 80)}`)
+    .join('|');
+  const chatKey = crypto
+    .createHash('sha256')
+    .update(`${trimmedMsg.toLowerCase()}|${targetAsset || ''}|${targetTimeframe || ''}|${tailKey}|${Boolean(lastImageMsg?.imageDataUrl)}`)
+    .digest('hex');
+
+  const cachedChat = chatCache.get(chatKey);
+  if (cachedChat && cachedChat.expiresAt > Date.now()) {
+    await recordCacheHit();
+    return cachedChat.result;
+  }
+
+  const pendingChat = inFlightChats.get(chatKey);
+  if (pendingChat) {
+    await recordDeduplicatedRequest();
+    return pendingChat;
+  }
+
+  const execPromise = (async (): Promise<ChatBundle> => {
+    await assertNotInRateLimitCooldown();
+    const ai = getGeminiClient();
+
+  // Run timeSync (cached 60s) + live market quote (cached 15s) in parallel!
+  let timeSyncMs = 0;
+  let quoteMs = 0;
+  const tSyncStart = Date.now();
+  const tQuoteStart = Date.now();
+
+  const [timeSync, liveQuote] = await Promise.all([
+    getSynchronizedBrasiliaTime(false).then((r) => {
+      timeSyncMs = Date.now() - tSyncStart;
+      return r;
+    }),
+    targetAsset
+      ? fetchMarketQuote(targetAsset, targetTimeframe).then((r) => {
+          quoteMs = Date.now() - tQuoteStart;
+          return r;
+        })
+      : Promise.resolve(null),
+  ]);
+
+  const quoteCtx = formatQuoteContext(liveQuote, null);
+  const hasPhotoOrAnalysis = Boolean(lastImageMsg || prevAnalysis);
+  const quoteSection = targetAsset
+    ? quoteCtx.contextText
+    : 'Nenhum ativo específico consultado nesta mensagem.';
+
+  // Send only up to 3 prior messages (excluding duplicate of current userMessage) to minimize token spend
+  const priorMessages =
+    params.messages.length > 0 &&
+    params.messages[params.messages.length - 1]?.role === 'user' &&
+    params.messages[params.messages.length - 1]?.text.trim() === params.userMessage.trim()
+      ? params.messages.slice(0, -1)
+      : params.messages;
+
+  const compactHistory = priorMessages
+    .slice(-3)
+    .map((m) => `${m.role === 'user' ? 'U' : 'IA'}(${m.createdAtBrt}): ${m.text.slice(0, 320)}`)
+    .join('\n');
+
+  // Re-attach the chart image ONLY when clarifying missing asset/timeframe or explicitly asked to re-examine the photo
+  const needsVisualReeval =
+    Boolean(lastImageMsg?.imageDataUrl) &&
+    (!prevAnalysis ||
+      prevAnalysis.needsClarification === 'ASSET' ||
+      prevAnalysis.needsClarification === 'TIMEFRAME' ||
+      /\b(reanalis\w*|ver\s+(a\s+)?(imagem|foto)|olh[ae]\s+(a\s+)?(imagem|foto)|na\s+(imagem|foto))\b/i.test(
+        params.userMessage,
+      ));
+
+  const prompt = [
+    `BRASÍLIA AGORA: ${timeSync.dateBrt} ${timeSync.timeBrt} (${timeSync.shortTimeBrt} BRT)`,
+    hasPhotoOrAnalysis
+      ? `ÚLTIMA ANÁLISE:\n${prevAnalysis ? prevAnalysis.formattedReport : 'Fotografia enviada anteriormente.'}`
+      : 'MODO CONVERSA DIRETA (nenhuma fotografia enviada ainda): responda dúvidas sobre mercado, análise técnica, gestão de risco ou ativos. Se houver cotação ao vivo abaixo, use os números reais. Só marque shouldAttachStructuredCard=true se houver análise anterior ou pedido explícito de sinal com dados suficientes; caso contrário mantenha shouldAttachStructuredCard=false.',
+    `COTAÇÃO ATUAL:\n${quoteSection}`,
+    compactHistory ? `ÚLTIMAS MENSAGENS:\n${compactHistory}` : null,
+    `PERGUNTA: "${params.userMessage}"`,
+    hasPhotoOrAnalysis
+      ? 'Se o sinal anterior já passou da entrada, alvo, stop ou horário, responda "SINAL EXPIRADO — NÃO ENTRAR NESTA CONDIÇÃO. AGUARDAR NOVA OPORTUNIDADE." Marque shouldAttachStructuredCard=true apenas em reanálise/expiração formal.'
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const chatSchema = {
+    type: Type.OBJECT,
+    properties: {
+      replyText: { type: Type.STRING },
+      shouldAttachStructuredCard: { type: Type.BOOLEAN },
+      decision: { type: Type.STRING, nullable: true },
+      expectedDirection: { type: Type.STRING, nullable: true },
+      expired: { type: Type.BOOLEAN },
+      asset: { type: Type.STRING, nullable: true },
+      timeframe: { type: Type.STRING, nullable: true },
+      entryWindowBrt: { type: Type.STRING, nullable: true },
+      expirationDuration: { type: Type.STRING, nullable: true },
+      exitWindowBrt: { type: Type.STRING, nullable: true },
+      timeRemainingToEntry: { type: Type.STRING, nullable: true },
+      signalValidity: { type: Type.STRING, nullable: true },
+      entryPrice: { type: Type.STRING, nullable: true },
+      targetPrice: { type: Type.STRING, nullable: true },
+      stopLoss: { type: Type.STRING, nullable: true },
+      technicalConfidence: { type: Type.NUMBER, nullable: true },
+      reason: { type: Type.STRING, nullable: true },
+      riskWarning: { type: Type.STRING, nullable: true },
+      entryCondition: { type: Type.STRING, nullable: true },
+      cancellationCondition: { type: Type.STRING, nullable: true },
+      nextAction: { type: Type.STRING, nullable: true },
+    },
+    required: ['replyText', 'shouldAttachStructuredCard', 'expired'],
+  };
+
+  const parts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
+  if (needsVisualReeval && lastImageMsg?.imageDataUrl) {
+    parts.push({ inlineData: parseBase64Image(lastImageMsg.imageDataUrl) });
+  }
+  parts.push({ text: prompt });
+
+  let rawJson = '{}';
+  let geminiMs = 0;
+  try {
+    const tGemStart = Date.now();
+    const resp = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: { parts },
+      config: {
+        systemInstruction:
+          'Analista financeiro conversacional conservador (PT-BR). Lógica de opções binárias: COMPRA (CALL) = aposta em SUBIDA acima da entrada no vencimento; VENDA (PUT) = aposta em QUEDA abaixo da entrada no vencimento. Nunca inverta direções, nunca recomende martingale ou recuperação dobrando mão, nunca prometa lucro e priorize proteção do capital.',
+        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+        responseMimeType: 'application/json',
+        responseSchema: chatSchema,
+      },
+    });
+    geminiMs = Date.now() - tGemStart;
+    await recordGeminiSuccess(resp.usageMetadata);
+    rawJson = (resp.text ?? '{}').trim();
+  } catch (err) {
+    const safeErr = await recordGeminiFailure(err);
+    throw new Error(safeErr);
+  }
+
+  const data = JSON.parse(rawJson) as {
+    replyText?: string;
+    shouldAttachStructuredCard?: boolean;
+    decision?: string | null;
+    expectedDirection?: string | null;
+    expired?: boolean;
+    asset?: string | null;
+    timeframe?: string | null;
+    entryWindowBrt?: string | null;
+    expirationDuration?: string | null;
+    exitWindowBrt?: string | null;
+    timeRemainingToEntry?: string | null;
+    signalValidity?: string | null;
+    entryPrice?: string | null;
+    targetPrice?: string | null;
+    stopLoss?: string | null;
+    technicalConfidence?: number | null;
+    reason?: string | null;
+    riskWarning?: string | null;
+    entryCondition?: string | null;
+    cancellationCondition?: string | null;
+    nextAction?: string | null;
+  };
+
+  let analysis: ChartAnalysisResult | undefined;
+  if (data.shouldAttachStructuredCard && data.decision) {
+    const rawDec = data.expired ? 'SINAL_EXPIRADO' : normalizeDecisionValue(data.decision);
+    const rawDir = normalizeExpectedDirection(data.expectedDirection);
+    const chatAsset = data.asset ?? targetAsset;
+    const chatTf = data.timeframe ?? targetTimeframe;
+
+    const validatedChat = validateSignalConsistency({
+      decision: rawDec,
+      expectedDirection: rawDir,
+      entryWindowBrt: data.entryWindowBrt ?? null,
+      exitWindowBrt: data.exitWindowBrt ?? null,
+      expirationDuration: data.expirationDuration ?? null,
+      nowTimeBrt: timeSync.shortTimeBrt,
+      asset: chatAsset,
+      reason: data.reason || data.replyText || 'Reavaliação concluída.',
+      riskWarning: data.riskWarning ?? data.cancellationCondition ?? null,
+    });
+
+    const base: Omit<ChartAnalysisResult, 'formattedReport'> = {
+      decision: validatedChat.decision,
+      expectedDirection: validatedChat.expectedDirection,
+      expired: Boolean(data.expired || validatedChat.decision === 'SINAL_EXPIRADO'),
+      asset: chatAsset,
+      normalizedSymbol: liveQuote?.available ? liveQuote.symbol : null,
+      timeframe: chatTf,
+      analysisTimeBrt: `${timeSync.dateBrt} ${timeSync.timeBrt}`,
+      photoReceivedAtBrt: lastImageMsg?.photoCapturedAtBrt || `${timeSync.dateBrt} ${timeSync.timeBrt}`,
+      entryWindowBrt: validatedChat.entryWindowBrt,
+      expirationDuration: validatedChat.expirationDuration,
+      exitWindowBrt: validatedChat.exitWindowBrt,
+      timeRemainingToEntry: data.timeRemainingToEntry ?? null,
+      signalValidity: data.signalValidity ?? validatedChat.expirationDuration ?? null,
+      entryPrice: data.entryPrice ?? null,
+      targetPrice: data.targetPrice ?? null,
+      stopLoss: data.stopLoss ?? null,
+      technicalConfidence:
+        typeof data.technicalConfidence === 'number'
+          ? Math.max(0, Math.min(100, Math.round(data.technicalConfidence)))
+          : null,
+      reason: validatedChat.reason,
+      riskWarning: data.riskWarning ?? data.cancellationCondition ?? null,
+      entryCondition: data.entryCondition ?? null,
+      cancellationCondition: data.cancellationCondition ?? data.riskWarning ?? null,
+      nextAction: validatedChat.nextAction ?? data.nextAction ?? null,
+      dataFreshnessStatus: quoteCtx.freshnessStatus,
+      dataFreshnessNote: quoteCtx.freshnessNote,
+      visibleIndicators: prevAnalysis?.visibleIndicators ?? [],
+    };
+    analysis = {
+      ...base,
+      formattedReport: buildFormattedReport(base),
+    };
+    if (!analysis.expired && (analysis.decision === 'COMPRA' || analysis.decision === 'VENDA')) {
+      await recordEmittedSignal({
+        analysis,
+        marketQuote: liveQuote,
+        origin: 'LIVE_AI',
+      }).catch(() => {});
+    }
+  }
+
+  const totalMs = Date.now() - tStart;
+  await recordLatency('text', totalMs);
+
+    return {
+      replyText: data.replyText || (analysis ? analysis.formattedReport : 'Não foi possível gerar resposta.'),
+      analysis,
+      marketQuote: liveQuote,
+      timeSync,
+      timings: { totalMs, timeSyncMs, quoteMs, geminiMs },
+    };
+  })();
+
+  inFlightChats.set(chatKey, execPromise);
+  try {
+    const bundle = await execPromise;
+    chatCache.set(chatKey, { expiresAt: Date.now() + CHAT_CACHE_TTL_MS, result: bundle });
+    if (chatCache.size > 40) {
+      const oldest = chatCache.keys().next().value;
+      if (oldest) chatCache.delete(oldest);
+    }
+    return bundle;
+  } finally {
+    inFlightChats.delete(chatKey);
+  }
+}
