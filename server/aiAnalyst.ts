@@ -88,14 +88,24 @@ function extractHintsFromText(
   text?: string,
   fallbackAsset?: string | null,
   fallbackTimeframe?: string | null,
-): { assetHint: string | null; timeframeHint: string | null } {
+): { assetHint: string | null; timeframeHint: string | null; isOtcHint: boolean } {
   let assetHint: string | null = null;
   let timeframeHint: string | null = null;
+  let isOtcHint = false;
 
   if (text && text.trim()) {
-    const tfMatch = text.match(/\b(1m|3m|5m|15m|30m|1h|2h|4h|1d|1w|m1|m5|m15|m30|h1|h4|d1)\b/i);
+    isOtcHint = /\bOTC\b/i.test(text);
+    const tfMatch = text.match(
+      /\b(1\s*min(?:uto)?s?|3\s*min(?:uto)?s?|5\s*min(?:uto)?s?|15\s*min(?:uto)?s?|30\s*min(?:uto)?s?|1m|3m|5m|15m|30m|1h|2h|4h|1d|1w|m1|m3|m5|m15|m30|h1|h4|d1)\b/i,
+    );
     if (tfMatch) {
-      timeframeHint = tfMatch[1].toLowerCase();
+      const rawTf = tfMatch[1].toLowerCase().replace(/\s+/g, '');
+      if (/^1min/.test(rawTf) || rawTf === 'm1') timeframeHint = '1m';
+      else if (/^3min/.test(rawTf) || rawTf === 'm3') timeframeHint = '3m';
+      else if (/^5min/.test(rawTf) || rawTf === 'm5') timeframeHint = '5m';
+      else if (/^15min/.test(rawTf) || rawTf === 'm15') timeframeHint = '15m';
+      else if (/^30min/.test(rawTf) || rawTf === 'm30') timeframeHint = '30m';
+      else timeframeHint = rawTf;
     }
 
     const rawTokens = text
@@ -105,14 +115,16 @@ function extractHintsFromText(
 
     const stopWords = new Set([
       'COMPRAR', 'COMPRA', 'VENDER', 'VENDA', 'AGUARDAR', 'ANALISAR', 'GRAFICO',
-      'GRÁFICO', 'PRECO', 'PREÇO', 'AGORA', 'HOJE', 'TESTE', 'OLHA', 'ESSE',
-      'MERCADO', 'MUDOU', 'SINAL', 'VALIDO', 'VÁLIDO', 'CANDLE', 'AINDA', 'POSSO',
-      'ENTRAR', 'SAIR', 'QUAL', 'RISCO', 'DESSA', 'SOBRE', 'HORA', 'TEMPO',
+      'GRÁFICO', 'GRAFICOS', 'GRÁFICOS', 'PRECO', 'PREÇO', 'AGORA', 'HOJE', 'TESTE',
+      'OLHA', 'ESSE', 'MERCADO', 'MUDOU', 'SINAL', 'VALIDO', 'VÁLIDO', 'CANDLE',
+      'CANDLES', 'AINDA', 'POSSO', 'ENTRAR', 'SAIR', 'QUAL', 'RISCO', 'DESSA',
+      'SOBRE', 'HORA', 'TEMPO', 'OTC', 'DA', 'DE', 'DO', 'NA', 'NO', 'MIN', 'MINUTO',
+      'MINUTOS', 'FOTOGRAFIA', 'FOTO', 'IMAGEM',
     ]);
 
     for (const rawToken of rawTokens) {
       const upper = rawToken.toUpperCase();
-      if (stopWords.has(upper) || /^(1M|3M|5M|15M|30M|1H|2H|4H|1D|1W|M1|M5|M15|M30|H1|H4|D1)$/.test(upper)) {
+      if (stopWords.has(upper) || /^(1M|3M|5M|15M|30M|1H|2H|4H|1D|1W|M1|M3|M5|M15|M30|H1|H4|D1)$/.test(upper)) {
         continue;
       }
       const norm = normalizeAssetQuery(upper);
@@ -121,15 +133,21 @@ function extractHintsFromText(
       const hasDigitOrSymbol = /[0-9/=^.-]/.test(rawToken);
       const isExplicitUppercase = rawToken === upper && /^[A-Z]{2,6}$/.test(rawToken);
       if (norm.market !== 'UNKNOWN' && (norm.market !== 'US_EQUITY' || hasDigitOrSymbol || isExplicitUppercase)) {
-        assetHint = upper;
+        assetHint = isOtcHint && !/\bOTC\b/i.test(upper) ? `${upper} OTC` : upper;
         break;
       }
     }
   }
 
+  const resolvedAsset = assetHint || fallbackAsset || null;
+  if (resolvedAsset && /\bOTC\b/i.test(resolvedAsset)) {
+    isOtcHint = true;
+  }
+
   return {
-    assetHint: assetHint || fallbackAsset || null,
+    assetHint: resolvedAsset,
     timeframeHint: timeframeHint || fallbackTimeframe || null,
+    isOtcHint,
   };
 }
 
@@ -138,6 +156,7 @@ interface VisualExtraction {
   imageReadable: boolean;
   unreadableReason: string | null;
   asset: string | null;
+  isOtc?: boolean;
   timeframe: string | null;
   chartLastPrice: number | null;
 }
@@ -149,6 +168,7 @@ const VISUAL_EXTRACTION_SCHEMA = {
     imageReadable: { type: Type.BOOLEAN },
     unreadableReason: { type: Type.STRING, nullable: true },
     asset: { type: Type.STRING, nullable: true },
+    isOtc: { type: Type.BOOLEAN, nullable: true },
     timeframe: { type: Type.STRING, nullable: true },
     chartLastPrice: { type: Type.NUMBER, nullable: true },
   },
@@ -166,11 +186,20 @@ const FINAL_DECISION_SCHEMA = {
       type: Type.STRING,
       description: 'SUBIDA (obrigatório se COMPRA), QUEDA (obrigatório se VENDA) ou INDEFINIDA (se AGUARDAR/EXPIRADO)',
     },
+    analysisQuality: {
+      type: Type.STRING,
+      description: 'Classificação da qualidade técnica da oportunidade: FORTE, MODERADA ou INSUFICIENTE',
+    },
+    waitCategory: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Obrigatório quando decision=AGUARDAR: IMAGEM_ILEGIVEL, MERCADO_LATERAL, SINAIS_CONTRADITORIOS ou AGUARDAR_CONFIRMACAO. Use null se COMPRA/VENDA.',
+    },
     expired: { type: Type.BOOLEAN },
     asset: { type: Type.STRING, nullable: true },
     timeframe: { type: Type.STRING, nullable: true },
     entryWindowBrt: { type: Type.STRING, nullable: true, description: 'Horário futuro de entrada em HH:MM BRT' },
-    expirationDuration: { type: Type.STRING, nullable: true, description: 'Tempo de expiração compatível com o timeframe (ex: 5 min, 15 min)' },
+    expirationDuration: { type: Type.STRING, nullable: true, description: 'Tempo de expiração compatível com o timeframe (para M1 use ex: 1 min, 2 min ou 3 min)' },
     exitWindowBrt: { type: Type.STRING, nullable: true, description: 'Horário de vencimento em HH:MM BRT posterior à entrada' },
     timeRemainingToEntry: { type: Type.STRING, nullable: true },
     signalValidity: { type: Type.STRING, nullable: true },
@@ -178,8 +207,23 @@ const FINAL_DECISION_SCHEMA = {
     targetPrice: { type: Type.STRING, nullable: true },
     stopLoss: { type: Type.STRING, nullable: true },
     technicalConfidence: { type: Type.NUMBER, nullable: true },
-    reason: { type: Type.STRING, description: 'JUSTIFICATIVA técnica objetiva de por que o gráfico favorece essa direção' },
-    riskWarning: { type: Type.STRING, nullable: true, description: 'RISCO: o que pode invalidar a previsão e fazer a operação falhar' },
+    reason: { type: Type.STRING, description: 'JUSTIFICATIVA técnica objetiva considerando contexto de 30-60 candles, tendência, estrutura, S/R e gatilho' },
+    riskWarning: { type: Type.STRING, nullable: true, description: 'RISCO: evidências contrárias e o que pode invalidar a previsão' },
+    favorableEvidences: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: 'Evidências técnicas objetivas a favor da operação ou direção',
+    },
+    contraryEvidences: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: 'Evidências contrárias ou pontos de atenção no gráfico',
+    },
+    entryTrigger: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Quando AGUARDAR, descreva exatamente o que falta acontecer no gráfico para justificar uma entrada',
+    },
     entryCondition: { type: Type.STRING, nullable: true },
     cancellationCondition: { type: Type.STRING, nullable: true },
     nextAction: { type: Type.STRING, nullable: true },
@@ -194,7 +238,17 @@ const FINAL_DECISION_SCHEMA = {
       items: { type: Type.STRING },
     },
   },
-  required: ['decision', 'expectedDirection', 'expired', 'reason', 'riskWarning', 'visibleIndicators'],
+  required: [
+    'decision',
+    'expectedDirection',
+    'analysisQuality',
+    'expired',
+    'reason',
+    'riskWarning',
+    'favorableEvidences',
+    'contraryEvidences',
+    'visibleIndicators',
+  ],
 };
 
 function parseBase64Image(dataUrlOrBase64: string, fallbackMime = 'image/jpeg'): { mimeType: string; data: string } {
@@ -376,7 +430,11 @@ export function buildGeminiContentsFromHistory(params: {
   };
 }
 
-function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | null): {
+function formatQuoteContext(
+  quote: MarketQuote | null,
+  chartLastPrice: number | null,
+  isOtc = false,
+): {
   freshnessStatus: ChartAnalysisResult['dataFreshnessStatus'];
   freshnessNote: string;
   contextText: string;
@@ -384,19 +442,25 @@ function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | 
   if (!quote || !quote.available) {
     return {
       freshnessStatus: 'SEM_COTACAO_TEMPO_REAL',
-      freshnessNote: quote?.warning || 'Cotação em tempo real indisponível para este ativo no momento.',
-      contextText: quote?.warning || 'SEM COTAÇÃO AO VIVO. Analise apenas visualmente e informe que não há confirmação de mercado em tempo real.',
+      freshnessNote: isOtc
+        ? 'Ativo OTC da corretora (preço sintético próprio): análise baseada nos candles visíveis da fotografia.'
+        : quote?.warning || 'Cotação externa indisponível; análise baseada diretamente nos candles visíveis.',
+      contextText: isOtc
+        ? 'ATIVO OTC DA CORRETORA: mercado OTC possui cotação sintética própria e não depende de feed externo. Analise normalmente os candles da fotografia sem recusar por falta de cotação externa.'
+        : (quote?.warning || 'SEM COTAÇÃO AO VIVO EXTERNA. Analise os candles visíveis da fotografia normalmente, indicando que a leitura é puramente gráfica.'),
     };
   }
 
   let freshnessStatus: ChartAnalysisResult['dataFreshnessStatus'] = 'ATUALIZADO';
   let diffNote = '';
 
-  if (chartLastPrice !== null && Number.isFinite(chartLastPrice) && quote.price > 0) {
+  if (isOtc) {
+    diffNote = `Ativo OTC: referência spot externa ${quote.price} ${quote.currency} (corretoras OTC possuem precificação própria e NÃO precisam coincidir com o preço spot; avalie os candles da imagem normalmente sem marcar SINAL_EXPIRADO por diferença OTC).`;
+  } else if (chartLastPrice !== null && Number.isFinite(chartLastPrice) && quote.price > 0) {
     const pctDiff = ((quote.price - chartLastPrice) / chartLastPrice) * 100;
     if (Math.abs(pctDiff) >= 0.8) {
       freshnessStatus = 'DEFASADO';
-      diffNote = `ATENÇÃO: Preço da foto (${chartLastPrice}) diverge em ${pctDiff >= 0 ? '+' : ''}${pctDiff.toFixed(2)}% da cotação atual (${quote.price} ${quote.currency}).`;
+      diffNote = `OBSERVAÇÃO: Preço visível na foto (${chartLastPrice}) difere em ${pctDiff >= 0 ? '+' : ''}${pctDiff.toFixed(2)}% da cotação spot (${quote.price} ${quote.currency}). Considere se houve movimentação ou spread/OTC da corretora antes de invalidar o setup.`;
     } else {
       diffNote = `Foto (${chartLastPrice}) alinhada à cotação atual (${quote.price} ${quote.currency}).`;
     }
@@ -404,9 +468,19 @@ function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | 
     diffNote = `Cotação ao vivo (${quote.provider}): ${quote.price} ${quote.currency}.`;
   }
 
-  // Send only the 5 most recent candles to keep input tokens lean
-  const candlesSummary = quote.candles
-    .slice(-5)
+  const recentCandles = quote.candles.slice(-24);
+  let windowSummary = '';
+  if (recentCandles.length >= 4) {
+    const minLow = Math.min(...recentCandles.map((c) => c.low));
+    const maxHigh = Math.max(...recentCandles.map((c) => c.high));
+    const firstOpen = recentCandles[0].open;
+    const lastClose = recentCandles[recentCandles.length - 1].close;
+    const bias = lastClose > firstOpen ? 'ALTISTA' : lastClose < firstOpen ? 'BAIXISTA' : 'NEUTRO';
+    windowSummary = `CONTEXTO ${recentCandles.length} CANDLES (${quote.timeframe}): mín ${minLow} | máx ${maxHigh} | viés ${bias}`;
+  }
+
+  const candlesSummary = recentCandles
+    .slice(-8)
     .map((c) => `[${c.timeBrt} A:${c.open} M:${c.high} m:${c.low} F:${c.close}]`)
     .join(' ');
 
@@ -414,7 +488,8 @@ function formatQuoteContext(quote: MarketQuote | null, chartLastPrice: number | 
     `ATIVO: ${quote.displayName} (${quote.symbol}) | PROVEDOR: ${quote.provider}`,
     `PREÇO ATUAL: ${quote.price} ${quote.currency} (${quote.fetchedAtBrt} BRT)${quote.changePercent24h !== null ? ` | VAR: ${quote.changePercent24h}%` : ''}`,
     diffNote,
-    candlesSummary ? `CANDLES (${quote.timeframe}): ${candlesSummary}` : null,
+    windowSummary || null,
+    candlesSummary ? `ÚLTIMOS CANDLES (${quote.timeframe}): ${candlesSummary}` : null,
   ]
     .filter(Boolean)
     .join('\n');
@@ -431,6 +506,13 @@ function parseMinutesOfDay(text?: string | null): number | null {
   const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (!m) return null;
   return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function formatMinutesToBrt(totalMin: number): string {
+  const m = ((totalMin % 1440) + 1440) % 1440;
+  const hh = String(Math.floor(m / 60)).padStart(2, '0');
+  const mm = String(m % 60).padStart(2, '0');
+  return `${hh}:${mm} BRT`;
 }
 
 function normalizeDecisionValue(raw?: string | null): ChartAnalysisResult['decision'] {
@@ -450,6 +532,31 @@ function normalizeExpectedDirection(
   return 'INDEFINIDA';
 }
 
+function normalizeAnalysisQuality(
+  raw?: string | null,
+  decision?: ChartAnalysisResult['decision'],
+): 'FORTE' | 'MODERADA' | 'INSUFICIENTE' {
+  const up = (raw || '').toUpperCase().trim();
+  if (decision === 'AGUARDAR' || decision === 'SINAL_EXPIRADO') {
+    return up === 'INSUFICIENTE' || up === 'MODERADA' ? up : 'INSUFICIENTE';
+  }
+  if (up.includes('FORTE')) return 'FORTE';
+  if (up.includes('MODERAD')) return 'MODERADA';
+  return 'MODERADA';
+}
+
+function normalizeWaitCategory(
+  raw?: string | null,
+  decision?: ChartAnalysisResult['decision'],
+): ChartAnalysisResult['waitCategory'] {
+  if (decision !== 'AGUARDAR') return null;
+  const up = (raw || '').toUpperCase().trim();
+  if (up.includes('ILEGIV') || up.includes('ILEGÍV') || up.includes('QUALIDADE')) return 'IMAGEM_ILEGIVEL';
+  if (up.includes('LATERAL') || up.includes('CONSOLID')) return 'MERCADO_LATERAL';
+  if (up.includes('CONTRADIT')) return 'SINAIS_CONTRADITORIOS';
+  return 'AGUARDAR_CONFIRMACAO';
+}
+
 function validateSignalConsistency(params: {
   decision: ChartAnalysisResult['decision'];
   expectedDirection: 'SUBIDA' | 'QUEDA' | 'INDEFINIDA';
@@ -458,6 +565,7 @@ function validateSignalConsistency(params: {
   expirationDuration: string | null;
   nowTimeBrt: string;
   asset: string | null;
+  timeframe?: string | null;
   reason: string;
   riskWarning: string | null;
 }): {
@@ -509,7 +617,7 @@ function validateSignalConsistency(params: {
 
   expectedDirection = decision === 'COMPRA' ? 'SUBIDA' : 'QUEDA';
 
-  // 2. Ensure entry time is not in the past relative to synchronized Brasília clock
+  // 2. Ensure entry time is not clearly in the past relative to synchronized Brasília clock (-2 min tolerance for M1 boundary ticks)
   const nowMin = parseMinutesOfDay(params.nowTimeBrt);
   const entryMin = parseMinutesOfDay(entryWindowBrt);
   const exitMin = parseMinutesOfDay(exitWindowBrt);
@@ -518,7 +626,7 @@ function validateSignalConsistency(params: {
     let deltaEntry = entryMin - nowMin;
     if (deltaEntry < -720) deltaEntry += 1440; // midnight rollover guard
     if (deltaEntry > 720) deltaEntry -= 1440;
-    if (deltaEntry < -1) {
+    if (deltaEntry < -2) {
       return {
         decision: 'AGUARDAR',
         expectedDirection: 'INDEFINIDA',
@@ -548,17 +656,18 @@ function validateSignalConsistency(params: {
     }
   }
 
-  // 4. Require identifiable asset for active directional trade signals
-  if (!params.asset) {
-    return {
-      decision: 'AGUARDAR',
-      expectedDirection: 'INDEFINIDA',
-      entryWindowBrt: null,
-      exitWindowBrt: null,
-      expirationDuration: null,
-      reason: `Ativo não identificado com segurança para emitir sinal direcional. ${reason}`,
-      nextAction: 'Informe o ativo ou envie foto enquadrando o código do ativo.',
-    };
+  if (!expirationDuration) {
+    const tfNorm = (params.timeframe || '').toLowerCase();
+    expirationDuration = /^(1m|m1|1\s*min)/.test(tfNorm) || !tfNorm ? '1 min' : '5 min';
+  }
+  if (nowMin !== null && !entryWindowBrt) {
+    entryWindowBrt = formatMinutesToBrt(nowMin + 1);
+  }
+  const resolvedEntryMin = parseMinutesOfDay(entryWindowBrt);
+  if (resolvedEntryMin !== null && !exitWindowBrt) {
+    const durMatch = expirationDuration.match(/(\d+)/);
+    const expMins = durMatch ? Math.max(1, Math.min(60, Number(durMatch[1]))) : 1;
+    exitWindowBrt = formatMinutesToBrt(resolvedEntryMin + expMins);
   }
 
   return {
@@ -572,6 +681,21 @@ function validateSignalConsistency(params: {
   };
 }
 
+function formatWaitCategoryLabel(cat?: ChartAnalysisResult['waitCategory']): string {
+  switch (cat) {
+    case 'IMAGEM_ILEGIVEL':
+      return 'IMAGEM ILEGÍVEL';
+    case 'MERCADO_LATERAL':
+      return 'MERCADO LATERAL';
+    case 'SINAIS_CONTRADITORIOS':
+      return 'SINAIS CONTRADITÓRIOS';
+    case 'AGUARDAR_CONFIRMACAO':
+      return 'AGUARDAR CONFIRMAÇÃO';
+    default:
+      return 'AGUARDAR CONFIRMAÇÃO';
+  }
+}
+
 function buildFormattedReport(
   raw: Omit<ChartAnalysisResult, 'formattedReport'>,
 ): string {
@@ -582,6 +706,7 @@ function buildFormattedReport(
       `ATIVO: ${raw.asset || 'Não identificado'}`,
       `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
       `HORÁRIO DA ANÁLISE: ${raw.analysisTimeBrt} — Brasília`,
+      raw.analysisQuality ? `QUALIDADE DA ANÁLISE: ${raw.analysisQuality}` : null,
       `JUSTIFICATIVA: ${raw.reason}`,
       `RISCO: ${raw.riskWarning || 'Entrada tardia reduz a assimetria da operação e aumenta risco de perda.'}`,
       raw.nextAction ? `PRÓXIMA AÇÃO: ${raw.nextAction}` : null,
@@ -592,16 +717,24 @@ function buildFormattedReport(
 
   if (raw.decision === 'AGUARDAR') {
     return [
-      'DECISÃO: AGUARDAR.',
+      `DECISÃO: AGUARDAR (${formatWaitCategoryLabel(raw.waitCategory)}).`,
       'DIREÇÃO ESPERADA: INDEFINIDA (AGUARDAR CONFIRMAÇÃO)',
       raw.asset ? `ATIVO: ${raw.asset}` : null,
       `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
       `HORÁRIO DA ANÁLISE: ${raw.analysisTimeBrt} — Brasília`,
+      raw.analysisQuality ? `QUALIDADE DA ANÁLISE: ${raw.analysisQuality}` : null,
       '',
       `JUSTIFICATIVA:\n${raw.reason}`,
+      raw.favorableEvidences && raw.favorableEvidences.length > 0
+        ? `\nEVIDÊNCIAS FAVORÁVEIS:\n- ${raw.favorableEvidences.join('\n- ')}`
+        : null,
+      raw.contraryEvidences && raw.contraryEvidences.length > 0
+        ? `\nEVIDÊNCIAS CONTRÁRIAS:\n- ${raw.contraryEvidences.join('\n- ')}`
+        : null,
       '',
       `RISCO:\n${raw.riskWarning || 'Operar sem confirmação clara ou contra suporte/resistência próximo eleva o risco de perda.'}`,
-      raw.nextAction ? `\nPRÓXIMA AÇÃO: ${raw.nextAction}` : null,
+      raw.entryTrigger ? `\nO QUE FALTA PARA ENTRADA: ${raw.entryTrigger}` : null,
+      raw.nextAction ? `PRÓXIMA AÇÃO: ${raw.nextAction}` : null,
       raw.clarificationQuestion ? `PERGUNTA: ${raw.clarificationQuestion}` : null,
     ]
       .filter(Boolean)
@@ -618,14 +751,21 @@ function buildFormattedReport(
     `ATIVO: ${raw.asset || 'Não identificado'}`,
     `HORÁRIO DE ENTRADA: ${raw.entryWindowBrt || 'Aguardar próximo candle (Brasília)'}`,
     `TIMEFRAME: ${raw.timeframe || 'Não informado'}`,
-    `EXPIRAÇÃO: ${raw.expirationDuration || 'Compatível com 1 a 2 candles do timeframe'}`,
+    `EXPIRAÇÃO: ${raw.expirationDuration || 'Compatível com 1 a 3 candles de M1'}`,
     `HORÁRIO DE VENCIMENTO: ${raw.exitWindowBrt || 'Fechamento da expiração (Brasília)'}`,
     raw.entryPrice ? `REGIÃO DE ENTRADA: ${raw.entryPrice}` : null,
     raw.stopLoss ? `INVALIDAÇÃO / STOP: ${raw.stopLoss}` : null,
     raw.targetPrice ? `ALVO TÉCNICO: ${raw.targetPrice}` : null,
-    `CONFIANÇA TÉCNICA: ${raw.technicalConfidence ?? 50}/100`,
+    `QUALIDADE DA ANÁLISE: ${raw.analysisQuality || 'MODERADA'}`,
+    `CONFIANÇA TÉCNICA: ${raw.technicalConfidence ?? 65}/100`,
     '',
     `JUSTIFICATIVA:\n${raw.reason}`,
+    raw.favorableEvidences && raw.favorableEvidences.length > 0
+      ? `\nEVIDÊNCIAS FAVORÁVEIS:\n- ${raw.favorableEvidences.join('\n- ')}`
+      : null,
+    raw.contraryEvidences && raw.contraryEvidences.length > 0
+      ? `\nEVIDÊNCIAS CONTRÁRIAS / ATENÇÃO:\n- ${raw.contraryEvidences.join('\n- ')}`
+      : null,
     '',
     `RISCO:\n${raw.riskWarning || raw.cancellationCondition || 'Reversão brusca ou rejeição em nível próximo de suporte/resistência pode invalidar a previsão.'}`,
   ]
@@ -656,6 +796,7 @@ async function runChartAnalysisUncached(params: {
 
   let detectedAsset: string | null = hints.assetHint;
   let detectedTimeframe: string | null = hints.timeframeHint;
+  let isOtcChart = hints.isOtcHint;
   let chartLastPrice: number | null = null;
 
   let timeSyncMs = 0;
@@ -666,6 +807,7 @@ async function runChartAnalysisUncached(params: {
 
   if (detectedAsset) {
     // Asset already known from caption/context: run time sync + live quote in parallel!
+    const lookupAsset = detectedAsset.replace(/\bOTC\b/gi, '').trim() || detectedAsset;
     const tSyncStart = Date.now();
     const tQuoteStart = Date.now();
     const [syncRes, quoteRes] = await Promise.all([
@@ -673,7 +815,7 @@ async function runChartAnalysisUncached(params: {
         timeSyncMs = Date.now() - tSyncStart;
         return r;
       }),
-      fetchMarketQuote(detectedAsset, detectedTimeframe).then((r) => {
+      fetchMarketQuote(lookupAsset, detectedTimeframe).then((r) => {
         quoteMs = Date.now() - tQuoteStart;
         return r;
       }),
@@ -691,7 +833,12 @@ async function runChartAnalysisUncached(params: {
           parts: [
             imagePart,
             {
-              text: 'Identifique apenas se é um gráfico financeiro legível, o código do ativo, o timeframe e o último preço visível. Não invente dados ilegíveis. Se não for legível, escreva unreadableReason em português (PT-BR).',
+              text: [
+                'Extraia apenas se é um gráfico financeiro, se os candles estão legíveis, o nome do ativo (preservando "OTC" se aparecer no gráfico e marcando isOtc=true), o timeframe e o último preço visível.',
+                'IMPORTANTE SOBRE LEGIBILIDADE: marque imageReadable=true sempre que for possível distinguir os candles e o movimento de preço, mesmo sem indicadores na tela, com variação no tamanho dos candles, leve reflexo ou ticker parcialmente cortado.',
+                'Marque imageReadable=false SOMENTE se NÃO for um gráfico financeiro ou se estiver totalmente borrado/pixelado a ponto de impedir distinguir os candles.',
+                'Se imageReadable=false, explique unreadableReason em português (PT-BR).',
+              ].join(' '),
             },
           ],
         },
@@ -717,13 +864,18 @@ async function runChartAnalysisUncached(params: {
       await recordGeminiSuccess(extractResp.usageMetadata);
 
       const extracted = JSON.parse((extractResp.text ?? '{}').trim()) as VisualExtraction;
+      if (extracted.isOtc || /\bOTC\b/i.test(extracted.asset || '')) {
+        isOtcChart = true;
+      }
+
       if (!extracted.isFinancialChart || !extracted.imageReadable) {
         const photoReceivedBrt = params.photoReceivedAtBrt || `${timeSync.dateBrt} ${timeSync.timeBrt}`;
         const reason =
           extracted.unreadableReason ||
-          'A imagem está cortada, desfocada ou não mostra um gráfico financeiro legível com candles e escala de preço identificáveis.';
+          'A imagem não permite distinguir os candles ou não apresenta um gráfico financeiro legível.';
         const base: Omit<ChartAnalysisResult, 'formattedReport'> = {
           decision: 'AGUARDAR',
+          expectedDirection: 'INDEFINIDA',
           expired: false,
           asset: extracted.asset || null,
           normalizedSymbol: null,
@@ -738,14 +890,20 @@ async function runChartAnalysisUncached(params: {
           targetPrice: null,
           stopLoss: null,
           technicalConfidence: null,
+          analysisQuality: 'INSUFICIENTE',
+          waitCategory: 'IMAGEM_ILEGIVEL',
+          favorableEvidences: [],
+          contraryEvidences: [reason],
+          entryTrigger: 'Enviar uma nova fotografia focada nos últimos 30 a 60 candles e no eixo de preços.',
           reason,
+          riskWarning: 'Operar sem leitura nítida dos candles impede avaliar tendência e níveis de rejeição.',
           entryCondition: null,
           cancellationCondition: null,
-          nextAction: 'Envie outra fotografia nítida enquadrando os candles, ativo e escala de preços.',
+          nextAction: 'Envie outra fotografia mais nítida enquadrando os candles e a escala de preços.',
           dataFreshnessStatus: 'SEM_COTACAO_TEMPO_REAL',
-          dataFreshnessNote: 'Análise visual interrompida por baixa legibilidade.',
+          dataFreshnessNote: 'Análise interrompida por imagem ilegível.',
           needsClarification: 'NEW_PHOTO',
-          clarificationQuestion: 'Poderia enviar outra fotografia mais nítida e sem cortes do gráfico?',
+          clarificationQuestion: 'Poderia enviar outra fotografia mais nítida enquadrando os candles?',
           visibleIndicators: [],
         };
         const totalMs = Date.now() - tStart;
@@ -759,6 +917,9 @@ async function runChartAnalysisUncached(params: {
       }
 
       detectedAsset = extracted.asset || null;
+      if (detectedAsset && isOtcChart && !/\bOTC\b/i.test(detectedAsset)) {
+        detectedAsset = `${detectedAsset} OTC`;
+      }
       detectedTimeframe = extracted.timeframe || detectedTimeframe;
       chartLastPrice = typeof extracted.chartLastPrice === 'number' ? extracted.chartLastPrice : null;
     } catch (err) {
@@ -767,32 +928,45 @@ async function runChartAnalysisUncached(params: {
     }
 
     if (detectedAsset) {
+      const lookupAsset = detectedAsset.replace(/\bOTC\b/gi, '').trim() || detectedAsset;
       const tQuoteStart = Date.now();
-      marketQuote = await fetchMarketQuote(detectedAsset, detectedTimeframe);
+      marketQuote = await fetchMarketQuote(lookupAsset, detectedTimeframe);
       quoteMs = Date.now() - tQuoteStart;
     }
   }
 
   const photoReceivedBrt = params.photoReceivedAtBrt || `${timeSync.dateBrt} ${timeSync.timeBrt}`;
   const analysisNow = await getSynchronizedBrasiliaTime(false);
-  const quoteCtx = formatQuoteContext(marketQuote, chartLastPrice);
+  const quoteCtx = formatQuoteContext(marketQuote, chartLastPrice, isOtcChart);
 
-  // Strict Binary Options Direction & Capital Protection Instruction
+  const isM1Context =
+    !detectedTimeframe || /^(1m|m1|1\s*min)/i.test(detectedTimeframe.trim());
+
   const systemInstruction = [
-    'Analista técnico financeiro conservador focado em proteção de capital (PT-BR).',
+    'Analista técnico especializado em leitura de fluxo de candles e price action para opções binárias (PT-BR).',
     'LÓGICA OBRIGATÓRIA DE OPÇÕES BINÁRIAS (NUNCA INVERTER): COMPRA (CALL) = previsão de SUBIDA (preço fecha ACIMA da entrada no vencimento). VENDA (PUT) = previsão de QUEDA (preço fecha ABAIXO da entrada no vencimento).',
-    'ANTES DE DECIDIR, AVALIE INTERNAMENTE OS 7 CRITÉRIOS: (1) maior evidência de subir ou cair na expiração; (2) tendência predominante; (3) confirmação dos candles/pavios; (4) suportes/resistências que podem travar o movimento; (5) momento adequado de entrada; (6) movimento compatível com o tempo de expiração; (7) evidências contrárias.',
-    'NUNCA recomende COMPRA só porque o último candle é verde, nem VENDA só porque o último candle é vermelho. Prefira perder oportunidade (AGUARDAR) a emitir sinal sem confirmação.',
-    'PROIBIDO: recomendar martingale, dobrar mão, aumentar frequência para recuperar perdas, prometer lucro/assertividade ou inventar preços/indicadores não visíveis.',
+    'PROTEÇÃO DE CAPITAL SEM EXCESSO DE AGUARDAR: nunca force entradas sem vantagem estatística visual, mas NÃO devolva AGUARDAR por excesso de perfeccionismo quando o gráfico apresenta leitura válida.',
+    'LEITURA ESPECÍFICA DE M1 (analise os últimos 30 a 60 candles visíveis, nunca apenas o último candle isolado): avalie (1) direção e força da tendência de curto prazo; (2) sequência de máximas e mínimas (topos e fundos ascendentes ou descendentes); (3) corpos e pavios dos candles; (4) suportes e resistências próximos; (5) rompimentos consistentes e falsos rompimentos; (6) rejeições de preço; (7) pullbacks em zonas rompidas e continuações; (8) engolfo, martelo, estrela cadente, doji e pin bar somente quando claramente visíveis.',
+    'REGRAS ANTI-FALSO-AGUARDAR NO M1: NÃO rejeite gráficos apenas porque (a) o mercado está em movimento ativo/forte sem ter feito pullback ainda, (b) os candles possuem variação natural de tamanho, (c) não existem indicadores técnicos na tela (price action puro é totalmente analisável), (d) um único candle isolado não confirmou sozinho se o contexto dos 30-60 candles já confirma, (e) a tendência tem pequenas oscilações e não é uma reta perfeita, ou (f) se trata de ativo OTC cujo preço próprio difere do feed externo.',
+    'NÃO exija que todos os critérios estejam perfeitos simultaneamente: pese evidências favoráveis vs contrárias e separe nitidez da IMAGEM de qualidade da OPORTUNIDADE (analysisQuality: FORTE, MODERADA ou INSUFICIENTE).',
+    'Quando houver setup FORTE ou MODERADO claro (ex.: tendência definida com topos/fundos alinhados, pullback em S/R rompido com retomada, rompimento consistente com corpo forte, ou falso rompimento / rejeição dupla em S/R com candle de confirmação), emita COMPRA (CALL) ou VENDA (PUT) com expiração M1 (1 min, 2 min ou 3 min).',
+    'Emita AGUARDAR apenas quando: (1) a imagem for realmente ilegível (IMAGEM_ILEGIVEL); (2) o mercado estiver em lateralidade/consolidação horizontal (range preso entre topo e fundo próximos, sem rompimento definido ou com candles alternando sem direção dominante -> OBRIGATORIAMENTE decision="AGUARDAR" e waitCategory="MERCADO_LATERAL"); (3) houver sinais fortemente contraditórios (SINAIS_CONTRADITORIOS, ex.: candle de alta batendo direto em resistência forte com pavios de rejeição ou velas conflitantes grandes); ou (4) falso rompimento/S-R ainda sem candle de confirmação (AGUARDAR_CONFIRMACAO), explicando exatamente em entryTrigger o que falta acontecer para entrar.',
+    'PROIBIDO: recomendar martingale, dobrar mão, aumentar frequência após perda, prometer lucro, inventar porcentagem de assertividade/win rate ou citar indicadores que não aparecem na foto.',
   ].join(' ');
 
   const decisionPrompt = [
-    `BRASÍLIA: foto ${photoReceivedBrt} | agora ${analysisNow.dateBrt} ${analysisNow.timeBrt} (${analysisNow.shortTimeBrt} BRT)`,
-    detectedAsset ? `ATIVO: ${detectedAsset}` : 'ATIVO: detectar na foto; se ilegível, pedir esclarecimento (needsClarification="ASSET") e responder AGUARDAR.',
-    detectedTimeframe ? `TIMEFRAME: ${detectedTimeframe}` : 'TIMEFRAME: detectar na foto; se não visível e impedir estimativa de horário/expiração, pedir (needsClarification="TIMEFRAME") e responder AGUARDAR.',
-    params.userMessage ? `USUÁRIO: "${params.userMessage}"` : null,
-    `MERCADO AO VIVO:\n${quoteCtx.contextText}`,
-    'REGRAS DE SAÍDA: Para COMPRA use expectedDirection="SUBIDA". Para VENDA use expectedDirection="QUEDA". Se lateralizado, contra S/R imediato, foto cortada/desfocada ou sem confirmação clara, responda decision="AGUARDAR" e expectedDirection="INDEFINIDA". Horário de entrada (entryWindowBrt) DEVE ser futuro (>= agora em Brasília) e horário de vencimento (exitWindowBrt) posterior à entrada, com expirationDuration explícita (ex: "5 min", "15 min"). Preencha reason (JUSTIFICATIVA) e riskWarning (RISCO: o que pode fazer a previsão falhar). Se foto defasada e movimento já passou, marque SINAL_EXPIRADO.',
+    `BRASÍLIA AGORA: ${analysisNow.dateBrt} ${analysisNow.timeBrt} (${analysisNow.shortTimeBrt} BRT) | FOTO RECEBIDA: ${photoReceivedBrt}`,
+    detectedAsset ? `ATIVO DETECTADO: ${detectedAsset}${isOtcChart ? ' (MERCADO OTC)' : ''}` : 'ATIVO: detectar na foto; se o código do ativo estiver cortado, ainda analise os candles normalmente se o gráfico estiver legível (asset=null).',
+    detectedTimeframe ? `TIMEFRAME: ${detectedTimeframe}` : 'TIMEFRAME: detectar na foto (se candles de opções binárias sem legenda explícita, assuma leitura M1 se compatível).',
+    params.userMessage ? `SOLICITAÇÃO DO USUÁRIO: "${params.userMessage}"` : null,
+    isM1Context ? 'MODO M1 ATIVO: priorize contexto de 30-60 candles, estrutura de topos/fundos, S/R próximos, rompimentos/falsos rompimentos, rejeições e pullbacks. Se emitir sinal, use expirationDuration entre "1 min", "2 min" ou "3 min".' : null,
+    `REFERÊNCIA DE MERCADO:\n${quoteCtx.contextText}`,
+    'INSTRUÇÕES DE SAÍDA JSON:',
+    '- COMPRA => expectedDirection="SUBIDA"; VENDA => expectedDirection="QUEDA".',
+    '- Para COMPRA/VENDA: preencha analysisQuality ("FORTE" ou "MODERADA"), waitCategory=null, entryWindowBrt futuro (>= ' + analysisNow.shortTimeBrt + ' BRT, ex: próximo minuto ou minuto atual), expirationDuration ("1 min", "2 min" ou "3 min" em M1), exitWindowBrt posterior à entrada, favorableEvidences e contraryEvidences.',
+    '- Para AGUARDAR: preencha analysisQuality="INSUFICIENTE" (ou "MODERADA" se aguardando só gatilho), waitCategory obrigatório (IMAGEM_ILEGIVEL | MERCADO_LATERAL | SINAIS_CONTRADITORIOS | AGUARDAR_CONFIRMACAO), entryTrigger descrevendo o gatilho exato que falta, favorableEvidences e contraryEvidences.',
+    '- Se o gráfico estiver lateralizado/em range horizontal sem rompimento claro, NÃO emita COMPRA nem VENDA: retorne decision="AGUARDAR" e waitCategory="MERCADO_LATERAL".',
+    '- NÃO marque SINAL_EXPIRADO em gráficos OTC apenas por diferença de cotação em relação ao mercado spot externo.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -828,6 +1002,8 @@ async function runChartAnalysisUncached(params: {
   const parsed = JSON.parse(finalText) as {
     decision?: string;
     expectedDirection?: string;
+    analysisQuality?: string;
+    waitCategory?: string | null;
     expired?: boolean;
     asset?: string | null;
     timeframe?: string | null;
@@ -842,6 +1018,9 @@ async function runChartAnalysisUncached(params: {
     technicalConfidence?: number | null;
     reason?: string;
     riskWarning?: string | null;
+    favorableEvidences?: string[];
+    contraryEvidences?: string[];
+    entryTrigger?: string | null;
     entryCondition?: string | null;
     cancellationCondition?: string | null;
     nextAction?: string | null;
@@ -850,9 +1029,12 @@ async function runChartAnalysisUncached(params: {
     visibleIndicators?: string[];
   };
 
-  const rawDecision = parsed.expired
+  let rawDecision = parsed.expired
     ? 'SINAL_EXPIRADO'
     : normalizeDecisionValue(parsed.decision);
+  if (isOtcChart && rawDecision === 'SINAL_EXPIRADO') {
+    rawDecision = 'AGUARDAR';
+  }
   const rawDirection = normalizeExpectedDirection(parsed.expectedDirection);
   const finalAsset = parsed.asset ?? detectedAsset ?? null;
   const finalTimeframe = parsed.timeframe ?? detectedTimeframe ?? null;
@@ -865,16 +1047,26 @@ async function runChartAnalysisUncached(params: {
     expirationDuration: parsed.expirationDuration ?? null,
     nowTimeBrt: analysisNow.shortTimeBrt,
     asset: finalAsset,
+    timeframe: finalTimeframe,
     reason: parsed.reason || 'Análise técnica concluída com base nos candles visíveis.',
     riskWarning: parsed.riskWarning ?? parsed.cancellationCondition ?? null,
   });
 
+  const normalizedQuality = normalizeAnalysisQuality(parsed.analysisQuality, validated.decision);
+  const normalizedWaitCat = normalizeWaitCategory(parsed.waitCategory, validated.decision);
+  const favorableList = Array.isArray(parsed.favorableEvidences)
+    ? parsed.favorableEvidences.filter((x) => typeof x === 'string' && x.trim().length > 0)
+    : [];
+  const contraryList = Array.isArray(parsed.contraryEvidences)
+    ? parsed.contraryEvidences.filter((x) => typeof x === 'string' && x.trim().length > 0)
+    : [];
+
   const baseResult: Omit<ChartAnalysisResult, 'formattedReport'> = {
     decision: validated.decision,
     expectedDirection: validated.expectedDirection,
-    expired: Boolean(parsed.expired || validated.decision === 'SINAL_EXPIRADO'),
+    expired: Boolean((parsed.expired && !isOtcChart) || validated.decision === 'SINAL_EXPIRADO'),
     asset: finalAsset,
-    normalizedSymbol: marketQuote?.available ? marketQuote.symbol : null,
+    normalizedSymbol: marketQuote?.available && !isOtcChart ? marketQuote.symbol : null,
     timeframe: finalTimeframe,
     analysisTimeBrt: `${analysisNow.dateBrt} ${analysisNow.timeBrt}`,
     photoReceivedAtBrt: photoReceivedBrt,
@@ -896,11 +1088,22 @@ async function runChartAnalysisUncached(params: {
       typeof parsed.technicalConfidence === 'number'
         ? Math.max(0, Math.min(100, Math.round(parsed.technicalConfidence)))
         : null,
+    analysisQuality: normalizedQuality,
+    waitCategory: normalizedWaitCat,
+    favorableEvidences: favorableList,
+    contraryEvidences: contraryList,
+    entryTrigger:
+      validated.decision === 'AGUARDAR'
+        ? (parsed.entryTrigger ?? parsed.nextAction ?? 'Aguardar candle de confirmação alinhado à estrutura.')
+        : null,
     reason: validated.reason,
     riskWarning: parsed.riskWarning ?? parsed.cancellationCondition ?? null,
     entryCondition: parsed.entryCondition ?? null,
     cancellationCondition: parsed.cancellationCondition ?? parsed.riskWarning ?? null,
-    nextAction: validated.nextAction ?? parsed.nextAction ?? null,
+    nextAction:
+      validated.decision === 'AGUARDAR'
+        ? (validated.nextAction ?? parsed.nextAction ?? parsed.entryTrigger ?? null)
+        : (validated.nextAction ?? parsed.nextAction ?? null),
     dataFreshnessStatus: quoteCtx.freshnessStatus,
     dataFreshnessNote: quoteCtx.freshnessNote,
     needsClarification: parsed.needsClarification ?? null,
@@ -1102,14 +1305,14 @@ export async function continueChartChat(params: {
       return r;
     }),
     targetAsset
-      ? fetchMarketQuote(targetAsset, targetTimeframe).then((r) => {
+      ? fetchMarketQuote(targetAsset.replace(/\bOTC\b/gi, '').trim() || targetAsset, targetTimeframe).then((r) => {
           quoteMs = Date.now() - tQuoteStart;
           return r;
         })
       : Promise.resolve(null),
   ]);
 
-  const quoteCtx = formatQuoteContext(liveQuote, null);
+  const quoteCtx = formatQuoteContext(liveQuote, null, hints.isOtcHint || /\bOTC\b/i.test(targetAsset || ''));
   const hasPhotoOrAnalysis = Boolean(lastImageMsg || prevAnalysis);
   const quoteSection = targetAsset
     ? quoteCtx.contextText

@@ -81,6 +81,16 @@ export interface ChartAnalysisResult {
   dataFreshnessNote: string;
   needsClarification?: 'ASSET' | 'TIMEFRAME' | 'NEW_PHOTO' | null;
   clarificationQuestion?: string | null;
+  analysisQuality?: 'FORTE' | 'MODERADA' | 'INSUFICIENTE' | null;
+  waitCategory?:
+    | 'IMAGEM_ILEGIVEL'
+    | 'MERCADO_LATERAL'
+    | 'SINAIS_CONTRADITORIOS'
+    | 'AGUARDAR_CONFIRMACAO'
+    | null;
+  favorableEvidences?: string[];
+  contraryEvidences?: string[];
+  entryTrigger?: string | null;
   visibleIndicators: string[];
   formattedReport: string;
 }
