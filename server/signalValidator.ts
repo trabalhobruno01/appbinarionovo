@@ -120,9 +120,8 @@ function resolveBrtClockToMs(hhmmText: string | null | undefined, referenceMs: n
   if (deltaMin < -720) deltaMin += 1440;
   if (deltaMin > 720) deltaMin -= 1440;
 
-  let candidate = referenceMs + deltaMin * 60_000;
-  // Round cleanly to zero seconds on minute boundary
-  candidate = Math.round(candidate / 60_000) * 60_000;
+  const refMinuteStartMs = Math.floor(referenceMs / 60_000) * 60_000;
+  let candidate = refMinuteStartMs + deltaMin * 60_000;
   if (minAfterMs !== undefined && candidate <= minAfterMs) {
     candidate = minAfterMs + 60_000;
   }
@@ -188,16 +187,27 @@ export function settleBinaryOutcome(params: {
   };
 }
 
+function getConfidenceBucket(confidence?: number | null): string {
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence)) return 'Não informado';
+  if (confidence < 65) return '< 65%';
+  if (confidence === 65) return '65%';
+  if (confidence <= 70) return '66% - 70%';
+  if (confidence <= 75) return '71% - 75%';
+  if (confidence <= 80) return '76% - 80%';
+  return '81% - 88%';
+}
+
 export async function recordEmittedSignal(params: {
   analysis: ChartAnalysisResult;
   marketQuote: MarketQuote | null;
   origin?: 'LIVE_AI' | 'DEMO_ACCOUNT';
   payoutPercent?: number;
   tieRule?: TieRule;
+  imageRefHash?: string | null;
   tenant?: TenantRef & { projectId?: string };
 }): Promise<SignalRecord | null> {
   const { analysis, marketQuote } = params;
-  // Never register non-directional or expired decisions as active trade signals
+  // Never register non-directional, below-threshold, or expired decisions as active trade signals
   if (analysis.expired || (analysis.decision !== 'COMPRA' && analysis.decision !== 'VENDA')) {
     return null;
   }
@@ -253,11 +263,38 @@ export async function recordEmittedSignal(params: {
     tieRule: params.tieRule ?? DEFAULT_TIE_RULE,
     netReturnUnits: null,
     settledAtBrt: null,
+    imageRefHash: params.imageRefHash || null,
+    confidencePct: analysis.technicalConfidence ?? null,
+    buyConfidencePct: analysis.buyConfidencePct ?? null,
+    sellConfidencePct: analysis.sellConfidencePct ?? null,
+    confidenceBucket: getConfidenceBucket(analysis.technicalConfidence),
+    marketRegime: analysis.marketRegime || 'INDETERMINADO',
   };
 
   ledger.unshift(record);
   await persistLedger(filePath, ledger);
   return record;
+}
+
+export async function invalidatePendingSignal(params: {
+  asset?: string | null;
+  entryTimeBrt?: string | null;
+  reason?: string;
+  tenant?: TenantRef;
+}): Promise<boolean> {
+  if (!params.asset) return false;
+  const { ledger, filePath } = await ensureLedgerLoaded(params.tenant);
+  const target = ledger.find(
+    (s) =>
+      s.status === 'PENDENTE' &&
+      s.asset === params.asset &&
+      (!params.entryTimeBrt || s.entryTimeBrt.endsWith(params.entryTimeBrt.replace(/\s*BRT$/i, '').trim())),
+  );
+  if (!target) return false;
+  target.status = 'SEM_DADOS';
+  target.note = params.reason || 'Sinal cancelado/invalidado antes ou no momento da entrada; excluído da taxa de acerto.';
+  await persistLedger(filePath, ledger);
+  return true;
 }
 
 export async function settlePendingSignals(
@@ -433,6 +470,9 @@ export async function getValidationSummary(
   const winRatePct = sampleSufficient
     ? Number(((wins / decidedSignals) * 100).toFixed(2))
     : null;
+  const lossRatePct = sampleSufficient
+    ? Number(((losses / decidedSignals) * 100).toFixed(2))
+    : null;
 
   const expectedValuePerTrade =
     sampleSufficient && settledSignals > 0
@@ -458,6 +498,7 @@ export async function getValidationSummary(
     unverified,
     sampleSufficient,
     winRatePct,
+    lossRatePct,
     wilson95LowPct: wilson?.low ?? null,
     wilson95HighPct: wilson?.high ?? null,
     netUnits: Number(netUnits.toFixed(2)),
@@ -469,6 +510,15 @@ export async function getValidationSummary(
     byTimeframe: aggregateByDimension(ledger, (r) => r.timeframe),
     byDirection: aggregateByDimension(ledger, (r) => r.direction),
     byExpiration: aggregateByDimension(ledger, (r) => r.expirationLabel),
+    byConfidenceBand: aggregateByDimension(
+      ledger,
+      (r) => r.confidenceBucket || getConfidenceBucket(r.confidencePct),
+    ),
+    byHourBrt: aggregateByDimension(ledger, (r) => {
+      const hh = r.entryTimeBrt?.split(' ')[1]?.slice(0, 2);
+      return hh ? `${hh}h BRT` : 'Indefinido';
+    }),
+    byMarketRegime: aggregateByDimension(ledger, (r) => r.marketRegime || 'INDETERMINADO'),
     signals: ledger.slice(0, 100),
   };
 }

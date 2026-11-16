@@ -64,6 +64,15 @@ export function AnalysisCard({
         : analysis.expectedDirection || 'INDEFINIDA';
 
   const DecisionIcon = decisionConfig.icon;
+  const hasComparativePct =
+    typeof analysis.buyConfidencePct === 'number' || typeof analysis.sellConfidencePct === 'number';
+  const bestDirLabel =
+    analysis.bestDirection && analysis.bestDirection !== 'INDEFINIDA'
+      ? analysis.bestDirection === 'COMPRA'
+        ? 'COMPRA (CALL)'
+        : 'VENDA (PUT)'
+      : 'INDEFINIDA';
+
   const quickQuestions = isBuy || isSell
     ? ['Ainda posso entrar agora?', 'O sinal continua válido?', 'Qual o risco dessa operação?']
     : ['O mercado mudou agora?', 'Devo aguardar o próximo candle?'];
@@ -75,14 +84,36 @@ export function AnalysisCard({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className={`flex items-center gap-2 font-display text-lg font-bold tracking-tight ${decisionConfig.textClass}`}>
             <DecisionIcon className="h-5 w-5 shrink-0" aria-hidden="true" />
-            <span>DECISÃO: {decisionConfig.label}</span>
+            <span>
+              DECISÃO: {decisionConfig.label}
+              {(isBuy || isSell) && !isExpired ? ' · ENTRADA CONSIDERÁVEL' : ''}
+            </span>
           </div>
           {analysis.technicalConfidence !== null && !isExpired && (
             <span className="font-mono-tabular text-xs font-semibold text-slate-700 dark:text-slate-300">
-              Qualidade Técnica: {analysis.technicalConfidence}/100
+              Confiança Estimada: {analysis.technicalConfidence}%
             </span>
           )}
         </div>
+
+        {/* Comparative CALL vs PUT Confidence Row */}
+        {hasComparativePct && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-mono-tabular">
+            {typeof analysis.buyConfidencePct === 'number' && (
+              <span className="font-semibold text-emerald-700 dark:text-emerald-400">
+                COMPRA (CALL): {analysis.buyConfidencePct}%
+              </span>
+            )}
+            {typeof analysis.sellConfidencePct === 'number' && (
+              <span className="font-semibold text-rose-700 dark:text-rose-400">
+                VENDA (PUT): {analysis.sellConfidencePct}%
+              </span>
+            )}
+            <span className="text-slate-600 dark:text-slate-400">
+              Melhor direção: <strong className="text-slate-900 dark:text-slate-200">{bestDirLabel}</strong>
+            </span>
+          </div>
+        )}
 
         {/* Unboxed clean metadata with typographic separators */}
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600 dark:text-slate-400">
@@ -128,6 +159,9 @@ export function AnalysisCard({
             </div>
             <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
               Expiração: {analysis.expirationDuration || analysis.signalValidity || analysis.timeframe || '1 candle'}
+              {analysis.expirationOptionsM1 && analysis.expirationOptionsM1.length > 1
+                ? ` (M1: ${analysis.expirationOptionsM1.join(' / ')})`
+                : ''}
             </div>
           </div>
 
@@ -180,7 +214,7 @@ export function AnalysisCard({
 
         {analysis.nextAction && (analysis.decision === 'AGUARDAR' || isExpired) && (
           <div>
-            <span className="font-semibold text-slate-900 dark:text-slate-100">Próxima Ação: </span>
+            <span className="font-semibold text-slate-900 dark:text-slate-100">Próxima Análise: </span>
             <span>{analysis.nextAction}</span>
           </div>
         )}
@@ -244,7 +278,9 @@ export function AnalysisCard({
 
       {/* Disclaimer line */}
       <p className="text-[11px] leading-snug text-slate-500 dark:text-slate-400">
-        Horários são janelas técnicas condicionais sujeitas à volatilidade do mercado, sem garantia de resultado. Foto recebida às {analysis.photoReceivedAtBrt} BRT.
+        {analysis.confidenceDisclaimer ||
+          'Horários são janelas técnicas condicionais sujeitas à volatilidade do mercado, sem garantia de resultado.'}{' '}
+        Foto recebida às {analysis.photoReceivedAtBrt} BRT.
       </p>
 
       {/* Quick one-tap follow-up buttons */}

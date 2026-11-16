@@ -72,6 +72,14 @@ export interface ChartAnalysisResult {
   targetPrice: string | null;
   stopLoss: string | null;
   technicalConfidence: number | null;
+  buyConfidencePct?: number | null;
+  sellConfidencePct?: number | null;
+  bestDirection?: 'COMPRA' | 'VENDA' | 'INDEFINIDA' | null;
+  confidenceDisclaimer?: string | null;
+  marketRegime?: 'TENDENCIA_ALTA' | 'TENDENCIA_BAIXA' | 'LATERAL' | 'REVERSAO' | 'INDETERMINADO' | null;
+  lateEntryDetected?: boolean;
+  expirationOptionsM1?: string[];
+  recommendedWaitMinutes?: number | null;
   reason: string;
   riskWarning?: string | null;
   entryCondition: string | null;
@@ -170,6 +178,12 @@ export interface SignalRecord {
   tieRule: TieRule;
   netReturnUnits: number | null;
   settledAtBrt: string | null;
+  imageRefHash?: string | null;
+  confidencePct?: number | null;
+  buyConfidencePct?: number | null;
+  sellConfidencePct?: number | null;
+  confidenceBucket?: string | null;
+  marketRegime?: string | null;
   note?: string;
 }
 
@@ -200,6 +214,7 @@ export interface SignalValidationSummary {
   unverified: number;
   sampleSufficient: boolean;
   winRatePct: number | null;
+  lossRatePct?: number | null;
   wilson95LowPct: number | null;
   wilson95HighPct: number | null;
   netUnits: number;
@@ -211,6 +226,9 @@ export interface SignalValidationSummary {
   byTimeframe: DimensionStats[];
   byDirection: DimensionStats[];
   byExpiration: DimensionStats[];
+  byConfidenceBand?: DimensionStats[];
+  byHourBrt?: DimensionStats[];
+  byMarketRegime?: DimensionStats[];
   signals: SignalRecord[];
 }
 
