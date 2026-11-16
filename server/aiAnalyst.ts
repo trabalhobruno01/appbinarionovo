@@ -1075,6 +1075,22 @@ function formatWaitCategoryLabel(cat?: ChartAnalysisResult['waitCategory']): str
   }
 }
 
+function normalizeDefaultTimeframe(tf?: string | null): string {
+  const trimmed = (tf || '').trim();
+  if (
+    !trimmed ||
+    /^(m1|1m|1\s*min(uto)?|m1\s*[—–-]\s*1\s*minuto|n[aã]o\s+informado)$/i.test(trimmed)
+  ) {
+    return 'M1';
+  }
+  return trimmed;
+}
+
+function formatTimeframeDisplay(tf?: string | null): string {
+  const normalized = normalizeDefaultTimeframe(tf);
+  return normalized === 'M1' ? 'M1 — 1 minuto' : normalized;
+}
+
 export function buildFormattedReport(
   raw: Omit<ChartAnalysisResult, 'formattedReport'>,
 ): string {
@@ -1097,7 +1113,7 @@ export function buildFormattedReport(
       '',
       'SINAL EXPIRADO — NÃO ENTRAR NESTA CONDIÇÃO. AGUARDAR NOVA OPORTUNIDADE.',
       raw.asset ? `Ativo: ${raw.asset}` : null,
-      `Tempo gráfico: ${raw.timeframe || 'Não informado'}`,
+      `Time frame: ${formatTimeframeDisplay(raw.timeframe)}`,
       `Horário oficial: ${raw.analysisTimeBrt} BRT`,
       buyPctText,
       sellPctText,
@@ -1124,7 +1140,7 @@ export function buildFormattedReport(
       'ANÁLISE DO GRÁFICO',
       '',
       raw.asset ? `Ativo: ${raw.asset}` : null,
-      `Tempo gráfico: ${raw.timeframe || 'Não informado'}`,
+      `Time frame: ${formatTimeframeDisplay(raw.timeframe)}`,
       `Horário da análise: ${raw.analysisTimeBrt} BRT`,
       buyPctText,
       sellPctText,
@@ -1162,7 +1178,7 @@ export function buildFormattedReport(
     'ANÁLISE DO GRÁFICO',
     '',
     raw.asset ? `Ativo: ${raw.asset}` : null,
-    `Tempo gráfico: ${raw.timeframe || 'M1'}`,
+    `Time frame: ${formatTimeframeDisplay(raw.timeframe)}`,
     buyPctText,
     sellPctText,
     `MELHOR DIREÇÃO: ${raw.decision} (${decisionLabel}).`,
@@ -1357,7 +1373,7 @@ async function runChartAnalysisUncached(params: {
           expired: false,
           asset: extracted.asset || null,
           normalizedSymbol: null,
-          timeframe: extracted.timeframe || null,
+          timeframe: normalizeDefaultTimeframe(extracted.timeframe),
           analysisTimeBrt: `${timeSync.dateBrt} ${timeSync.timeBrt}`,
           photoReceivedAtBrt: photoReceivedBrt,
           entryWindowBrt: null,
@@ -1441,7 +1457,9 @@ async function runChartAnalysisUncached(params: {
   const decisionPrompt = [
     `BRASÍLIA AGORA (RELÓGIO OFICIAL DO SERVIDOR): ${analysisNow.dateBrt} ${analysisNow.timeBrt} (${analysisNow.shortTimeBrt} BRT) | FOTO RECEBIDA: ${photoReceivedBrt}`,
     detectedAsset ? `ATIVO DETECTADO: ${detectedAsset}${isOtcChart ? ' (MERCADO OTC)' : ''}` : 'ATIVO: detectar na foto; se cortado, analise os candles normalmente com asset=null.',
-    detectedTimeframe ? `TIMEFRAME: ${detectedTimeframe}` : 'TIMEFRAME: detectar na foto (se compatível com candles curtos de binárias sem legenda, considere M1).',
+    detectedTimeframe
+      ? `TIMEFRAME: ${detectedTimeframe} (período de cada vela; não confundir com tempo de expiração da operação).`
+      : 'TIMEFRAME PADRÃO: M1 — 1 minuto (cada vela representa exatamente 1 minuto; considerar M1 como padrão e não confundir período da vela com tempo de expiração da operação).',
     params.userMessage ? `SOLICITAÇÃO / CONTEXTO DO USUÁRIO: "${params.userMessage}"` : null,
     isM1Context
       ? 'MODO M1 ATIVO: examine de 30 a 60 candles visíveis. Não force entrada a cada minuto. Para sinais válidos em M1, defina expirationDuration entre "1 min", "2 min", "3 min" ou "5 min" conforme a estrutura e preencha expirationOptionsM1.'
@@ -1529,7 +1547,7 @@ async function runChartAnalysisUncached(params: {
   }
   const rawDirection = normalizeExpectedDirection(parsed.expectedDirection);
   const finalAsset = parsed.asset ?? detectedAsset ?? null;
-  const finalTimeframe = parsed.timeframe ?? detectedTimeframe ?? null;
+  const finalTimeframe = normalizeDefaultTimeframe(parsed.timeframe ?? detectedTimeframe ?? null);
 
   const favorableList = Array.isArray(parsed.favorableEvidences)
     ? parsed.favorableEvidences.filter((x) => typeof x === 'string' && x.trim().length > 0)
@@ -2152,7 +2170,7 @@ export async function continueChartChat(params: {
       const rawDec = data.expired ? 'SINAL_EXPIRADO' : normalizeDecisionValue(data.decision);
       const rawDir = normalizeExpectedDirection(data.expectedDirection);
       const chatAsset = data.asset ?? targetAsset ?? null;
-      const chatTf = data.timeframe ?? targetTimeframe ?? null;
+      const chatTf = normalizeDefaultTimeframe(data.timeframe ?? targetTimeframe ?? null);
 
       const chatPolicy = evaluateDecisionAndConfidencePolicy({
         decision: rawDec,

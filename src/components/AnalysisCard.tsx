@@ -16,6 +16,17 @@ interface AnalysisCardProps {
   disabled?: boolean;
 }
 
+function formatTimeframeDisplay(tf?: string | null): string {
+  const trimmed = (tf || '').trim();
+  if (
+    !trimmed ||
+    /^(m1|1m|1\s*min(uto)?|m1\s*[—–-]\s*1\s*minuto|n[aã]o\s+informado)$/i.test(trimmed)
+  ) {
+    return 'M1 — 1 minuto';
+  }
+  return trimmed;
+}
+
 export function AnalysisCard({
   analysis,
   marketQuote,
@@ -125,7 +136,7 @@ export function AnalysisCard({
             {analysis.asset || 'Ativo não identificado'}
           </span>
           <span aria-hidden="true">·</span>
-          <span>Timeframe {analysis.timeframe || 'Não informado'}</span>
+          <span>Time frame: {formatTimeframeDisplay(analysis.timeframe)}</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono-tabular">
             Análise {analysis.analysisTimeBrt} BRT
@@ -158,7 +169,7 @@ export function AnalysisCard({
               {analysis.exitWindowBrt || 'Condicional à expiração'}
             </div>
             <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-              Expiração: {analysis.expirationDuration || analysis.signalValidity || analysis.timeframe || '1 candle'}
+              Expiração da operação: {analysis.expirationDuration || analysis.signalValidity || '1 candle'}
               {analysis.expirationOptionsM1 && analysis.expirationOptionsM1.length > 1
                 ? ` (M1: ${analysis.expirationOptionsM1.join(' / ')})`
                 : ''}
@@ -191,46 +202,11 @@ export function AnalysisCard({
         </div>
       )}
 
-      {/* Technical Justification & Risk */}
-      <div className="space-y-2 rounded-xl border border-slate-200 bg-white p-3.5 text-sm leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
-        <div>
-          <span className="font-semibold text-slate-900 dark:text-slate-100">Justificativa: </span>
-          <span>{analysis.reason}</span>
+      {analysis.needsClarification === 'NEW_PHOTO' && analysis.clarificationQuestion && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs font-medium text-amber-800 dark:text-amber-300">
+          {analysis.clarificationQuestion}
         </div>
-
-        {(analysis.riskWarning || analysis.cancellationCondition) && (
-          <div>
-            <span className="font-semibold text-rose-700 dark:text-rose-400">Risco: </span>
-            <span>{analysis.riskWarning || analysis.cancellationCondition}</span>
-          </div>
-        )}
-
-        {analysis.entryCondition && (isBuy || isSell) && !isExpired && (
-          <div>
-            <span className="font-semibold text-slate-900 dark:text-slate-100">Condição de Entrada: </span>
-            <span>{analysis.entryCondition}</span>
-          </div>
-        )}
-
-        {analysis.nextAction && (analysis.decision === 'AGUARDAR' || isExpired) && (
-          <div>
-            <span className="font-semibold text-slate-900 dark:text-slate-100">Próxima Análise: </span>
-            <span>{analysis.nextAction}</span>
-          </div>
-        )}
-
-        {analysis.clarificationQuestion && (
-          <div className="pt-1 font-medium text-amber-700 dark:text-amber-300">
-            {analysis.clarificationQuestion}
-          </div>
-        )}
-
-        {analysis.visibleIndicators.length > 0 && (
-          <div className="pt-1 text-xs text-slate-500 dark:text-slate-400">
-            Indicadores observados na foto: {analysis.visibleIndicators.join(' · ')}
-          </div>
-        )}
-      </div>
+      )}
 
       {/* Live Market Quote & Freshness Verification */}
       <div className="rounded-xl border border-slate-200 bg-slate-50/80 px-3.5 py-2.5 text-xs dark:border-slate-800 dark:bg-slate-900/50">

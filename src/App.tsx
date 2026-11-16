@@ -550,7 +550,7 @@ function ChartPulseWorkspace({
       setClockOffsetMs(syncedOffset);
 
       const assetLabel = result.analysis.asset || convWithUser.lastAsset || 'Gráfico Financeiro';
-      const tfLabel = result.analysis.timeframe || convWithUser.lastTimeframe;
+      const tfLabel = result.analysis.timeframe || convWithUser.lastTimeframe || 'M1';
 
       const aiMsg: ChatMessage = {
         id: `msg_${Date.now()}_a`,
@@ -860,7 +860,9 @@ function ChartPulseWorkspace({
                         <div className="space-y-3">
                           {msg.text &&
                             !msg.text.startsWith('DECISÃO:') &&
-                            !msg.text.startsWith('SINAL EXPIRADO') && (
+                            !msg.text.startsWith('SINAL EXPIRADO') &&
+                            !msg.text.startsWith('ANÁLISE DO GRÁFICO') &&
+                            msg.text.trim() !== (msg.analysis.formattedReport || '').trim() && (
                               <p className="text-sm leading-relaxed text-slate-800 dark:text-slate-200 whitespace-pre-line">
                                 {msg.text}
                               </p>
